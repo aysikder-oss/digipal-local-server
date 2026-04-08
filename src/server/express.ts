@@ -157,6 +157,10 @@ async function autoSyncOnStartup() {
   }
 
   if (syncState.hub_token && syncState.cloud_url && !isHubRevoked()) {
+    if (syncState.sync_enabled === 0) {
+      console.log('[auto-sync] Hub token found but sync disabled by user preference — skipping');
+      return;
+    }
     startCloudSyncIfNeeded();
     console.log('[auto-sync] Hub token found — CloudSync WebSocket started');
     return;
@@ -295,7 +299,7 @@ function resolvePermissions(subscriberId: number): PermissionKey[] {
   try {
     const db = getDb();
     const sub = db.prepare('SELECT account_role FROM subscribers WHERE id = ?').get(subscriberId) as { account_role: string } | undefined;
-    if (!sub) return [...ALL_PERMISSIONS];
+    if (!sub) return [];
     if (sub.account_role === 'owner' || !sub.account_role) return [...ALL_PERMISSIONS];
 
     const membership = db.prepare(`
@@ -322,7 +326,7 @@ function resolvePermissions(subscriberId: number): PermissionKey[] {
     return Array.from(permSet);
   } catch (e: any) {
     console.error('[resolvePermissions] Error:', e.message);
-    return [...ALL_PERMISSIONS];
+    return [];
   }
 }
 
@@ -737,7 +741,7 @@ export async function startServer(port: number): Promise<number> {
     const unpushedCount = getUnpushedChangeCount();
     res.json({
       syncEnabled: syncState?.sync_enabled !== 0,
-      isConnected: !!(cloudSync && !isHubRevoked()),
+      isConnected: !!(cloudSync?.isConnected() && !isHubRevoked()),
       isRegistered: !!syncState?.hub_token,
       lastSyncAt: syncState?.last_sync_at || null,
       lastCloudContact: syncState?.last_cloud_contact_at || null,
@@ -852,7 +856,7 @@ export async function startServer(port: number): Promise<number> {
       return res.json({ message: 'No local changes to push', totalPushed: 0 });
     }
 
-    if (cloudSync) {
+    if (cloudSync?.isConnected()) {
       const changes = unpushed.map((change: any) => {
         const row = change.operation !== 'DELETE'
           ? getFullRow(change.table_name, change.record_id)
@@ -866,15 +870,18 @@ export async function startServer(port: number): Promise<number> {
         };
       });
 
-      cloudSync.sendMessage({
+      const sent = cloudSync.sendMessage({
         type: 'hubSyncPush',
         payload: { changes },
       });
 
-      const ids = unpushed.map((c: any) => c.id);
-      markChangesPushed(ids);
-
-      res.json({ message: `Pushed ${changes.length} changes to cloud`, totalPushed: changes.length });
+      if (sent) {
+        const ids = unpushed.map((c: any) => c.id);
+        markChangesPushed(ids);
+        res.json({ message: `Pushed ${changes.length} changes to cloud`, totalPushed: changes.length });
+      } else {
+        res.status(503).json({ message: 'WebSocket connection lost during send. Please retry.' });
+      }
     } else {
       res.status(400).json({ message: 'Cloud sync is not connected. Enable sync first.' });
     }

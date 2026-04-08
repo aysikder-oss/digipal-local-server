@@ -293,8 +293,14 @@ export class CloudSync {
     }
   }
 
-  sendMessage(message: any) {
+  isConnected(): boolean {
+    return !!(this.ws && this.ws.readyState === WebSocket.OPEN);
+  }
+
+  sendMessage(message: any): boolean {
+    if (!this.isConnected()) return false;
     this.send(message);
+    return true;
   }
 
   private send(message: any) {
