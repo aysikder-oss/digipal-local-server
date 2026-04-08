@@ -161,16 +161,16 @@ export async function authenticateUser(email: string, password: string): Promise
 
   if (cloudUrl) {
     try {
-      const res = await fetch(`${cloudUrl}/api/auth/login`, {
+      const res = await fetch(`${cloudUrl}/api/customer/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       });
 
       if (res.ok) {
-        const data = await res.json() as { subscriber?: Record<string, unknown>; user?: Record<string, unknown> };
-        const raw = data.subscriber || data.user;
-        if (raw && typeof raw.id === 'number') {
+        const data = await res.json() as Record<string, unknown>;
+        const raw = (data.subscriber || data.user || data) as Record<string, unknown>;
+        if (raw && typeof raw.id === 'number' && !raw.requires2fa) {
           const { hash, salt } = hashPassword(password);
           const storedHash = formatHash(salt, hash);
 
