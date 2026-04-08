@@ -484,9 +484,10 @@ export async function startServer(port: number): Promise<number> {
         const check = await authenticateUser((sub as any).email, currentPassword);
         if (!check.success) return res.status(401).json({ message: 'Current password is incorrect' });
       }
-      const bcrypt = await import('bcryptjs');
-      const hash = await bcrypt.hash(newPassword, 10);
-      db.prepare('UPDATE subscribers SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(hash, req.session.subscriberId);
+      const salt = crypto.randomBytes(16).toString('hex');
+      const hash = crypto.pbkdf2Sync(newPassword, salt, 10000, 64, 'sha512').toString('hex');
+      const storedHash = `${salt}:${hash}`;
+      db.prepare('UPDATE subscribers SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(storedHash, req.session.subscriberId);
       res.json({ ok: true });
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
@@ -753,12 +754,19 @@ export async function startServer(port: number): Promise<number> {
     try {
       const { ids } = req.body;
       if (!Array.isArray(ids)) return res.status(400).json({ message: 'ids array required' });
+      const subscriberId = req.session.subscriberId;
+      const teamIds = req.session.teamMemberships?.map((m: any) => m.teamId) || [];
+      let deleted = 0;
       for (const id of ids) {
         const content = await storage.getContent(Number(id));
+        if (!content) continue;
+        const ownerId = (content as any).owner_id || (content as any).subscriber_id;
+        if (ownerId !== subscriberId && !teamIds.includes(ownerId)) continue;
         if (content?.localPath) deleteLocalFile(path.basename(content.localPath));
         await storage.deleteContent(Number(id));
+        deleted++;
       }
-      res.json({ ok: true, deleted: ids.length });
+      res.json({ ok: true, deleted });
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -766,11 +774,19 @@ export async function startServer(port: number): Promise<number> {
     try {
       const { ids, folderId } = req.body;
       if (!Array.isArray(ids)) return res.status(400).json({ message: 'ids array required' });
+      const subscriberId = req.session.subscriberId;
+      const teamIds = req.session.teamMemberships?.map((m: any) => m.teamId) || [];
       const db = getDb();
+      let moved = 0;
       for (const id of ids) {
+        const content = await storage.getContent(Number(id));
+        if (!content) continue;
+        const ownerId = (content as any).owner_id || (content as any).subscriber_id;
+        if (ownerId !== subscriberId && !teamIds.includes(ownerId)) continue;
         db.prepare('UPDATE contents SET folder_id = ? WHERE id = ?').run(folderId ?? null, Number(id));
+        moved++;
       }
-      res.json({ ok: true, moved: ids.length });
+      res.json({ ok: true, moved });
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
