@@ -26,7 +26,48 @@ let initialSyncStatus: { inProgress: boolean; step: string; error: string | null
   inProgress: false, step: '', error: null, completedAt: null,
 };
 
-async function runInitialCloudSync(subscriberId: number, cloudUrl: string, sessionCookie: string) {
+async function getCloudSession(cloudUrl: string, email: string, password: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${cloudUrl}/api/customer/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+      redirect: 'manual',
+    });
+
+    if (!res.ok) return null;
+
+    const cookies: string[] = [];
+    const raw = res.headers.get('set-cookie');
+    if (raw) {
+      for (const part of raw.split(/,(?=\s*\w+=)/)) {
+        const name = part.trim().split(';')[0];
+        if (name) cookies.push(name);
+      }
+    }
+
+    try {
+      const getter = (res.headers as any).getSetCookie;
+      if (typeof getter === 'function') {
+        const setCookies = getter.call(res.headers) as string[];
+        if (setCookies.length > 0) {
+          cookies.length = 0;
+          for (const c of setCookies) {
+            const name = c.split(';')[0];
+            if (name) cookies.push(name);
+          }
+        }
+      }
+    } catch {}
+
+    return cookies.length > 0 ? cookies.join('; ') : null;
+  } catch (e: any) {
+    console.log('[initial-sync] Failed to get cloud session:', e.message);
+    return null;
+  }
+}
+
+async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email: string, password: string) {
   const db = getDb();
   const screenCount = (db.prepare('SELECT COUNT(*) as c FROM screens WHERE owner_id = ?').get(subscriberId) as any)?.c || 0;
   if (screenCount > 0) {
@@ -34,7 +75,16 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, sessi
     return;
   }
 
-  initialSyncStatus = { inProgress: true, step: 'Starting sync...', error: null, completedAt: null };
+  initialSyncStatus = { inProgress: true, step: 'Authenticating with cloud...', error: null, completedAt: null };
+
+  const sessionCookie = await getCloudSession(cloudUrl, email, password);
+  if (!sessionCookie) {
+    initialSyncStatus = { inProgress: false, step: '', error: 'Could not authenticate with cloud for data sync', completedAt: null };
+    console.log('[initial-sync] Could not obtain cloud session cookie — skipping sync');
+    return;
+  }
+
+  console.log('[initial-sync] Cloud session obtained, starting data pull...');
 
   const endpoints = [
     { path: '/api/customer/screens', table: 'screens' },
@@ -48,13 +98,17 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, sessi
     { path: '/api/customer/widgets', table: 'widgets' },
   ];
 
+  let totalSynced = 0;
   for (const ep of endpoints) {
     try {
       initialSyncStatus.step = `Syncing ${ep.table.replace(/_/g, ' ')}...`;
       const res = await fetch(`${cloudUrl}${ep.path}`, {
         headers: { 'Cookie': sessionCookie, 'Accept': 'application/json' },
       });
-      if (!res.ok) continue;
+      if (!res.ok) {
+        console.log(`[initial-sync] ${ep.table}: HTTP ${res.status}`);
+        continue;
+      }
       const data = await res.json() as any[];
       if (!Array.isArray(data) || data.length === 0) continue;
 
@@ -69,6 +123,7 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, sessi
           }
         }
       });
+      totalSynced += data.length;
       console.log(`[initial-sync] Synced ${data.length} rows for ${ep.table}`);
     } catch (e: any) {
       console.log(`[initial-sync] Skipped ${ep.table}: ${e.message}`);
@@ -76,7 +131,7 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, sessi
   }
 
   initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
-  console.log('[initial-sync] Initial cloud data sync complete');
+  console.log(`[initial-sync] Initial cloud data sync complete — ${totalSynced} total rows`);
 }
 
 const MAX_UPLOAD_SIZE = 500 * 1024 * 1024;
@@ -456,13 +511,11 @@ export async function startServer(port: number): Promise<number> {
     res.setHeader('Set-Cookie', `session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`);
     res.json(result.subscriber);
 
-    if (result.cloudSessionCookie) {
-      const syncState = getSyncState();
-      const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
-      runInitialCloudSync(result.subscriber!.id as number, cloudUrl, result.cloudSessionCookie).catch(e =>
-        console.error('[initial-sync] Error:', e.message)
-      );
-    }
+    const syncState = getSyncState();
+    const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
+    runInitialCloudSync(result.subscriber!.id as number, cloudUrl, email, password).catch(e =>
+      console.error('[initial-sync] Error:', e.message)
+    );
   });
 
   app.get('/api/customer/sync-status', requireAuth, (_req: Request, res: Response) => {

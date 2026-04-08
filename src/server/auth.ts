@@ -16,7 +16,6 @@ export interface AuthResult {
   success: boolean;
   subscriber?: Subscriber;
   error?: string;
-  cloudSessionCookie?: string;
 }
 
 interface SessionRow {
@@ -196,15 +195,10 @@ export async function authenticateUser(email: string, password: string): Promise
 
           hydrateTeamMemberships(raw.id as number, cloudUrl);
 
-          const setCookieHeaders = res.headers.getSetCookie?.() || [];
-          const cloudSessionCookie = setCookieHeaders
-            .map((c: string) => c.split(';')[0])
-            .join('; ');
-
           const subscriber: Subscriber = {
             id: raw.id, name, email, company, status, plan, accountRole,
           };
-          return { success: true, subscriber, cloudSessionCookie: cloudSessionCookie || undefined };
+          return { success: true, subscriber };
         }
       } else {
         const errData = await res.json().catch(() => ({ message: '' })) as { message?: string };
