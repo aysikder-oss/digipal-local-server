@@ -389,6 +389,142 @@ export async function startServer(port: number): Promise<number> {
   app.use(express.urlencoded({ extended: true }));
   app.use(sessionMiddleware);
 
+  app.post('/api/customer/login', async (req: Request, res: Response) => {
+    if (hubBlocked) return res.status(503).json({ message: 'Hub is blocked — another Digipal hub was detected on this network. Only one hub is allowed per network.' });
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
+    const result = await authenticateUser(email, password);
+    if (!result.success) return res.status(401).json({ message: result.error });
+    const sessionId = createSession(result.subscriber!.id);
+    res.setHeader('Set-Cookie', `session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`);
+    res.json(result.subscriber);
+  });
+
+  app.post('/api/customer/logout', (req: Request, res: Response) => {
+    const token = req.session?.token;
+    if (token) deleteSession(token);
+    res.setHeader('Set-Cookie', 'session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+    res.json({ ok: true });
+  });
+
+  app.get('/api/customer/me', requireAuth, async (req: Request, res: Response) => {
+    const sub = getSessionSubscriber(req.session.subscriberId);
+    if (!sub) return res.status(401).json({ message: 'Session expired' });
+    const perms = resolvePermissions(sub.id);
+    const role = (sub as any).account_role || (sub as any).accountRole || 'viewer';
+    res.json({
+      ...sub,
+      accountRole: role,
+      workspace: {
+        teamId: null,
+        teamName: null,
+        role: role,
+        permissions: perms,
+        isOwner: role === 'owner',
+      },
+    });
+  });
+
+  app.get('/api/customer/features', requireAuth, (_req: Request, res: Response) => {
+    res.json({
+      playlists: true,
+      schedules: true,
+      analytics: true,
+      designStudio: true,
+      smartTriggers: true,
+      aiAnalytics: false,
+      kioskDesigner: true,
+      videoWalls: true,
+      doohAds: false,
+      teamManagement: true,
+      broadcasts: true,
+      knowledgeBase: false,
+      directory: false,
+      screenCast: true,
+      smartQr: true,
+    });
+  });
+
+  app.get('/api/customer/storage', requireAuth, async (_req: Request, res: Response) => {
+    try {
+      const usage = getMediaDiskUsage();
+      res.json({ usedMB: Math.round(usage / 1024 / 1024), limitMB: 10240, percentage: Math.round(usage / (10240 * 1024 * 1024) * 100) });
+    } catch { res.json({ usedMB: 0, limitMB: 10240, percentage: 0 }); }
+  });
+
+  app.get('/api/customer/workspaces', requireAuth, async (req: Request, res: Response) => {
+    const sub = getSessionSubscriber(req.session.subscriberId);
+    const perms = resolvePermissions(req.session.subscriberId);
+    const role = (sub as any)?.account_role || (sub as any)?.accountRole || 'viewer';
+    res.json({
+      workspaces: [{
+        teamId: null,
+        teamName: 'Personal',
+        role: role,
+        permissions: perms,
+        isOwner: role === 'owner',
+      }],
+      teamCategories: [],
+    });
+  });
+
+  app.get('/api/customer/permissions', requireAuth, (req: Request, res: Response) => {
+    const perms = resolvePermissions(req.session.subscriberId);
+    res.json({ permissions: perms });
+  });
+
+  app.post('/api/customer/change-password', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const db = getDb();
+      const { currentPassword, newPassword } = req.body;
+      if (!newPassword) return res.status(400).json({ message: 'New password required' });
+      const sub = getSessionSubscriber(req.session.subscriberId);
+      if (!sub) return res.status(401).json({ message: 'Session expired' });
+      if (currentPassword) {
+        const check = await authenticateUser((sub as any).email, currentPassword);
+        if (!check.success) return res.status(401).json({ message: 'Current password is incorrect' });
+      }
+      const bcrypt = await import('bcryptjs');
+      const hash = await bcrypt.hash(newPassword, 10);
+      db.prepare('UPDATE subscribers SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(hash, req.session.subscriberId);
+      res.json({ ok: true });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  const customerPathMap: Record<string, string> = {
+    '/api/customer/screens': '/api/screens',
+    '/api/customer/contents': '/api/contents',
+    '/api/customer/folders': '/api/content-folders',
+    '/api/customer/playlists': '/api/playlists',
+    '/api/customer/schedules': '/api/schedules',
+    '/api/customer/teams': '/api/teams',
+    '/api/customer/notifications': '/api/notifications',
+    '/api/customer/screen-groups': '/api/screen-groups',
+    '/api/customer/kiosks': '/api/kiosks',
+    '/api/customer/smart-triggers': '/api/smart-triggers',
+    '/api/customer/broadcasts': '/api/broadcasts',
+    '/api/customer/video-walls': '/api/video-walls',
+    '/api/customer/approvals': '/api/approvals',
+    '/api/customer/widgets': '/api/widgets',
+    '/api/customer/qr-codes': '/api/qr-codes',
+    '/api/customer/announcements': '/api/announcements',
+    '/api/customer/analytics': '/api/analytics',
+    '/api/customer/team-members': '/api/team-members',
+    '/api/customer/team-roles': '/api/team-roles',
+    '/api/customer/team-screens': '/api/team-screens',
+    '/api/customer/team-categories': '/api/team-categories',
+    '/api/customer/check-name': '/api/check-name',
+  };
+  app.use((req: Request, _res: Response, next: NextFunction) => {
+    for (const [prefix, target] of Object.entries(customerPathMap)) {
+      if (req.path === prefix || req.path.startsWith(prefix + '/')) {
+        req.url = req.url.replace(prefix, target);
+        break;
+      }
+    }
+    next();
+  });
+
   app.post('/api/auth/login', async (req: Request, res: Response) => {
     if (hubBlocked) return res.status(503).json({ message: 'Hub is blocked — another Digipal hub was detected on this network. Only one hub is allowed per network.' });
     const { email, password } = req.body;
@@ -431,7 +567,7 @@ export async function startServer(port: number): Promise<number> {
       lastCloudContact: syncState?.last_cloud_contact_at,
       unpushedChanges: unpushedCount,
       hubName: syncState?.hub_name,
-      version: '1.0.0',
+      version: '1.2.0',
       mode: 'local',
       isLocalServer: true,
       cloudUrl,
@@ -610,6 +746,55 @@ export async function startServer(port: number): Promise<number> {
       if (content?.localPath) deleteLocalFile(path.basename(content.localPath));
       await storage.deleteContent(Number(req.params.id));
       res.json({ ok: true });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.post('/api/contents/bulk/delete', requireAuth, requirePermission('content.delete'), async (req: Request, res: Response) => {
+    try {
+      const { ids } = req.body;
+      if (!Array.isArray(ids)) return res.status(400).json({ message: 'ids array required' });
+      for (const id of ids) {
+        const content = await storage.getContent(Number(id));
+        if (content?.localPath) deleteLocalFile(path.basename(content.localPath));
+        await storage.deleteContent(Number(id));
+      }
+      res.json({ ok: true, deleted: ids.length });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.post('/api/contents/bulk/move', requireAuth, requirePermission('content.edit'), async (req: Request, res: Response) => {
+    try {
+      const { ids, folderId } = req.body;
+      if (!Array.isArray(ids)) return res.status(400).json({ message: 'ids array required' });
+      const db = getDb();
+      for (const id of ids) {
+        db.prepare('UPDATE contents SET folder_id = ? WHERE id = ?').run(folderId ?? null, Number(id));
+      }
+      res.json({ ok: true, moved: ids.length });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.patch('/api/contents/:id/move', requireAuth, requirePermission('content.edit'), requireOwnership('contents'), async (req: Request, res: Response) => {
+    try {
+      const db = getDb();
+      db.prepare('UPDATE contents SET folder_id = ? WHERE id = ?').run(req.body.folderId ?? null, Number(req.params.id));
+      const content = await storage.getContent(Number(req.params.id));
+      res.json(content);
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.get('/api/check-name', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const { table, name, excludeId } = req.query;
+      const db = getDb();
+      const t = String(table || 'contents');
+      const allowedTables = ['contents', 'playlists', 'screens', 'schedules', 'broadcasts', 'kiosks', 'video_walls', 'smart_triggers'];
+      if (!allowedTables.includes(t)) return res.status(400).json({ message: 'Invalid table' });
+      let query = `SELECT id FROM ${t} WHERE name = ? AND owner_id = ?`;
+      const params: any[] = [String(name), req.session.subscriberId];
+      if (excludeId) { query += ' AND id != ?'; params.push(Number(excludeId)); }
+      const existing = db.prepare(query).get(...params);
+      res.json({ exists: !!existing });
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 

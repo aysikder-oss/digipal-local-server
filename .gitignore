@@ -1,5 +1,7 @@
 node_modules/
-dist/
+dist/main/
+dist/server/
+dist/db/
 release/
 *.exe
 *.dmg
