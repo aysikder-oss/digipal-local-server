@@ -1,6 +1,6 @@
 {
   "name": "digipal-local-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Digipal On-Premise Local Server",
   "main": "dist/main/index.js",
   "scripts": {
@@ -9,11 +9,11 @@
     "build:all": "npm run build:frontend && npm run build",
     "start": "electron .",
     "postinstall": "electron-builder install-app-deps",
-    "pack": "npm run build:all && electron-builder --dir",
-    "dist": "npm run build:all && electron-builder --publish never",
-    "dist:win": "npm run build:all && electron-builder --win --publish never",
-    "dist:mac": "npm run build:all && electron-builder --mac --publish never",
-    "dist:linux": "npm run build:all && electron-builder --linux --publish never"
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder --publish never",
+    "dist:win": "npm run build && electron-builder --win --publish never",
+    "dist:mac": "npm run build && electron-builder --mac --publish never",
+    "dist:linux": "npm run build && electron-builder --linux --publish never"
   },
   "build": {
     "appId": "com.digipal.localserver",
@@ -23,25 +23,38 @@
     },
     "files": [
       "dist/**/*",
+      "src/renderer/**/*",
       "package.json"
     ],
     "win": {
-      "target": ["nsis"],
+      "target": [
+        "nsis"
+      ],
       "icon": "build/icon.png"
     },
     "mac": {
-      "target": ["dmg"],
+      "target": [
+        "dmg"
+      ],
       "icon": "build/icon.png",
       "category": "public.app-category.business"
     },
     "linux": {
-      "target": ["AppImage"],
+      "target": [
+        "AppImage"
+      ],
       "icon": "build/icon.png"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
-    }
+    },
+    "extraResources": [
+      {
+        "from": "src/renderer",
+        "to": "renderer"
+      }
+    ]
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0",
