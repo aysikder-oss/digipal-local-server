@@ -898,6 +898,14 @@ export async function startServer(port: number): Promise<number> {
       return res.json({ message: 'No local changes to push', totalPushed: 0 });
     }
 
+    const syncState = getSyncState();
+    const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
+    const hubToken = syncState?.hub_token;
+
+    if (!hubToken) {
+      return res.status(400).json({ message: 'No hub token — please log in to register this hub first.' });
+    }
+
     const changes = unpushed.map((change: any) => {
       const row = change.operation !== 'DELETE'
         ? getFullRow(change.table_name, change.record_id)
@@ -911,27 +919,6 @@ export async function startServer(port: number): Promise<number> {
         payload: change.payload || JSON.stringify(row || {}),
       };
     });
-
-    if (cloudSync?.isConnected()) {
-      const sent = cloudSync.sendMessage({
-        type: 'hubSyncPush',
-        payload: { changes },
-      });
-
-      if (sent) {
-        const ids = unpushed.map((c: any) => c.id);
-        markChangesPushed(ids);
-        return res.json({ message: `Pushed ${changes.length} changes to cloud via WebSocket`, totalPushed: changes.length });
-      }
-    }
-
-    const syncState = getSyncState();
-    const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
-    const hubToken = syncState?.hub_token;
-
-    if (!hubToken) {
-      return res.status(400).json({ message: 'No hub token — please log in to register this hub first.' });
-    }
 
     try {
       const pushRes = await fetch(`${cloudUrl}/api/hub/sync/push`, {
@@ -948,9 +935,9 @@ export async function startServer(port: number): Promise<number> {
       const result = await pushRes.json();
       const ids = unpushed.map((c: any) => c.id);
       markChangesPushed(ids);
-      res.json({ message: `Pushed ${result.applied || changes.length} changes to cloud via REST`, totalPushed: result.applied || changes.length });
+      res.json({ message: `Pushed ${result.applied || changes.length} changes to cloud`, totalPushed: result.applied || changes.length });
     } catch (e: any) {
-      console.error('[cloud-push] REST fallback error:', e.message);
+      console.error('[cloud-push] Error:', e.message);
       res.status(500).json({ message: `Push failed: ${e.message}` });
     }
   });
