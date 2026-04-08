@@ -5,7 +5,7 @@ import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-import { getDb, getSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount } from '../db/sqlite';
+import { getDb, getSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount, upsertRow, withoutTriggers } from '../db/sqlite';
 import { startMdns, stopMdns, scanForExistingHubs } from './mdns';
 import { CloudSync } from './cloud-sync';
 import { getConnectedPlayers, registerPlayer, unregisterPlayer, broadcastToPlayers } from './player-bus';
@@ -21,6 +21,63 @@ let hubBlocked = false;
 let discoveredHubs: Array<{ name: string; host: string; port: number }> = [];
 let sessionCleanupInterval: NodeJS.Timeout | null = null;
 const storage = new SqliteStorage();
+
+let initialSyncStatus: { inProgress: boolean; step: string; error: string | null; completedAt: string | null } = {
+  inProgress: false, step: '', error: null, completedAt: null,
+};
+
+async function runInitialCloudSync(subscriberId: number, cloudUrl: string, sessionCookie: string) {
+  const db = getDb();
+  const screenCount = (db.prepare('SELECT COUNT(*) as c FROM screens WHERE owner_id = ?').get(subscriberId) as any)?.c || 0;
+  if (screenCount > 0) {
+    initialSyncStatus = { inProgress: false, step: 'Data already synced', error: null, completedAt: new Date().toISOString() };
+    return;
+  }
+
+  initialSyncStatus = { inProgress: true, step: 'Starting sync...', error: null, completedAt: null };
+
+  const endpoints = [
+    { path: '/api/customer/screens', table: 'screens' },
+    { path: '/api/customer/contents', table: 'contents' },
+    { path: '/api/customer/playlists', table: 'playlists' },
+    { path: '/api/customer/folders', table: 'content_folders' },
+    { path: '/api/customer/schedules', table: 'schedules' },
+    { path: '/api/customer/screen-groups', table: 'screen_groups' },
+    { path: '/api/customer/broadcasts', table: 'broadcasts' },
+    { path: '/api/customer/qr-codes', table: 'smart_qr_codes' },
+    { path: '/api/customer/widgets', table: 'widgets' },
+  ];
+
+  for (const ep of endpoints) {
+    try {
+      initialSyncStatus.step = `Syncing ${ep.table.replace(/_/g, ' ')}...`;
+      const res = await fetch(`${cloudUrl}${ep.path}`, {
+        headers: { 'Cookie': sessionCookie, 'Accept': 'application/json' },
+      });
+      if (!res.ok) continue;
+      const data = await res.json() as any[];
+      if (!Array.isArray(data) || data.length === 0) continue;
+
+      withoutTriggers(() => {
+        for (const row of data) {
+          try {
+            if (row && typeof row.id !== 'undefined') {
+              upsertRow(ep.table, row);
+            }
+          } catch (e: any) {
+            // skip individual row errors
+          }
+        }
+      });
+      console.log(`[initial-sync] Synced ${data.length} rows for ${ep.table}`);
+    } catch (e: any) {
+      console.log(`[initial-sync] Skipped ${ep.table}: ${e.message}`);
+    }
+  }
+
+  initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
+  console.log('[initial-sync] Initial cloud data sync complete');
+}
 
 const MAX_UPLOAD_SIZE = 500 * 1024 * 1024;
 
@@ -398,6 +455,22 @@ export async function startServer(port: number): Promise<number> {
     const sessionId = createSession(result.subscriber!.id);
     res.setHeader('Set-Cookie', `session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`);
     res.json(result.subscriber);
+
+    if (result.cloudSessionCookie) {
+      const syncState = getSyncState();
+      const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
+      runInitialCloudSync(result.subscriber!.id as number, cloudUrl, result.cloudSessionCookie).catch(e =>
+        console.error('[initial-sync] Error:', e.message)
+      );
+    }
+  });
+
+  app.get('/api/customer/sync-status', requireAuth, (_req: Request, res: Response) => {
+    res.json(initialSyncStatus);
+  });
+
+  app.get('/api/instagram/accounts', requireAuth, (_req: Request, res: Response) => {
+    res.json([]);
   });
 
   app.post('/api/customer/logout', (req: Request, res: Response) => {
@@ -472,8 +545,11 @@ export async function startServer(port: number): Promise<number> {
   app.get('/api/customer/storage', requireAuth, async (_req: Request, res: Response) => {
     try {
       const { totalBytes } = getMediaDiskUsage();
-      res.json({ usedMB: Math.round(totalBytes / 1024 / 1024), limitMB: 10240, percentage: Math.round(totalBytes / (10240 * 1024 * 1024) * 100) });
-    } catch { res.json({ usedMB: 0, limitMB: 10240, percentage: 0 }); }
+      const usedMb = Math.round(totalBytes / 1024 / 1024);
+      const totalMb = 10240;
+      const percentUsed = totalMb > 0 ? Math.round((usedMb / totalMb) * 100) : 0;
+      res.json({ usedBytes: totalBytes, totalBytes: totalMb * 1024 * 1024, usedMb, totalMb, percentUsed, licenseCount: 1 });
+    } catch { res.json({ usedBytes: 0, totalBytes: 10240 * 1024 * 1024, usedMb: 0, totalMb: 10240, percentUsed: 0, licenseCount: 1 }); }
   });
 
   app.get('/api/customer/workspaces', requireAuth, async (req: Request, res: Response) => {
