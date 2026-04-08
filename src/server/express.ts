@@ -28,38 +28,48 @@ let initialSyncStatus: { inProgress: boolean; step: string; error: string | null
 
 async function getCloudSession(cloudUrl: string, email: string, password: string): Promise<string | null> {
   try {
+    console.log(`[initial-sync] Authenticating with cloud at ${cloudUrl}/api/customer/login`);
     const res = await fetch(`${cloudUrl}/api/customer/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, password }),
-      redirect: 'manual',
     });
 
-    if (!res.ok) return null;
+    console.log(`[initial-sync] Cloud login status: ${res.status}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.log(`[initial-sync] Cloud login failed: ${body.substring(0, 200)}`);
+      return null;
+    }
 
     const cookies: string[] = [];
-    const raw = res.headers.get('set-cookie');
-    if (raw) {
-      for (const part of raw.split(/,(?=\s*\w+=)/)) {
-        const name = part.trim().split(';')[0];
-        if (name) cookies.push(name);
-      }
-    }
 
     try {
       const getter = (res.headers as any).getSetCookie;
       if (typeof getter === 'function') {
         const setCookies = getter.call(res.headers) as string[];
-        if (setCookies.length > 0) {
-          cookies.length = 0;
-          for (const c of setCookies) {
-            const name = c.split(';')[0];
-            if (name) cookies.push(name);
-          }
+        console.log(`[initial-sync] getSetCookie returned ${setCookies.length} cookies`);
+        for (const c of setCookies) {
+          const nameVal = c.split(';')[0];
+          if (nameVal) cookies.push(nameVal);
         }
       }
-    } catch {}
+    } catch (e: any) {
+      console.log(`[initial-sync] getSetCookie failed: ${e.message}`);
+    }
 
+    if (cookies.length === 0) {
+      const raw = res.headers.get('set-cookie');
+      console.log(`[initial-sync] Fallback set-cookie header: ${raw ? raw.substring(0, 100) + '...' : 'null'}`);
+      if (raw) {
+        for (const part of raw.split(/,(?=\s*\w+=)/)) {
+          const nameVal = part.trim().split(';')[0];
+          if (nameVal) cookies.push(nameVal);
+        }
+      }
+    }
+
+    console.log(`[initial-sync] Extracted ${cookies.length} cookie(s): ${cookies.map(c => c.split('=')[0]).join(', ')}`);
     return cookies.length > 0 ? cookies.join('; ') : null;
   } catch (e: any) {
     console.log('[initial-sync] Failed to get cloud session:', e.message);
@@ -70,6 +80,8 @@ async function getCloudSession(cloudUrl: string, email: string, password: string
 async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email: string, password: string) {
   const db = getDb();
   const screenCount = (db.prepare('SELECT COUNT(*) as c FROM screens WHERE owner_id = ?').get(subscriberId) as any)?.c || 0;
+  console.log(`[initial-sync] Local screen count for subscriber ${subscriberId}: ${screenCount}`);
+
   if (screenCount > 0) {
     initialSyncStatus = { inProgress: false, step: 'Data already synced', error: null, completedAt: new Date().toISOString() };
     return;
@@ -80,7 +92,6 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
   const sessionCookie = await getCloudSession(cloudUrl, email, password);
   if (!sessionCookie) {
     initialSyncStatus = { inProgress: false, step: '', error: 'Could not authenticate with cloud for data sync', completedAt: null };
-    console.log('[initial-sync] Could not obtain cloud session cookie — skipping sync');
     return;
   }
 
@@ -96,6 +107,7 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
     { path: '/api/customer/broadcasts', table: 'broadcasts' },
     { path: '/api/customer/qr-codes', table: 'smart_qr_codes' },
     { path: '/api/customer/widgets', table: 'widgets' },
+    { path: '/api/customer/video-walls', table: 'video_walls' },
   ];
 
   let totalSynced = 0;
@@ -109,8 +121,12 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
         console.log(`[initial-sync] ${ep.table}: HTTP ${res.status}`);
         continue;
       }
-      const data = await res.json() as any[];
-      if (!Array.isArray(data) || data.length === 0) continue;
+      const raw = await res.json();
+      const data = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' && Array.isArray(raw.data)) ? raw.data : null;
+      if (!data || data.length === 0) {
+        console.log(`[initial-sync] ${ep.table}: ${data ? '0 rows' : 'non-array response'}`);
+        continue;
+      }
 
       withoutTriggers(() => {
         for (const row of data) {
@@ -119,7 +135,7 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
               upsertRow(ep.table, row);
             }
           } catch (e: any) {
-            // skip individual row errors
+            console.log(`[initial-sync] Row error in ${ep.table}: ${e.message}`);
           }
         }
       });
@@ -520,6 +536,23 @@ export async function startServer(port: number): Promise<number> {
 
   app.get('/api/customer/sync-status', requireAuth, (_req: Request, res: Response) => {
     res.json(initialSyncStatus);
+  });
+
+  app.post('/api/customer/force-sync', requireAuth, async (req: Request, res: Response) => {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ message: 'Email and password required for sync' });
+    const syncState = getSyncState();
+    const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
+
+    const db = getDb();
+    db.prepare('DELETE FROM screens WHERE owner_id = ?').run(req.session.subscriberId);
+    db.prepare('DELETE FROM contents WHERE owner_id = ?').run(req.session.subscriberId);
+    db.prepare('DELETE FROM playlists WHERE owner_id = ?').run(req.session.subscriberId);
+
+    res.json({ message: 'Sync started' });
+    runInitialCloudSync(req.session.subscriberId, cloudUrl, email, password).catch(e =>
+      console.error('[force-sync] Error:', e.message)
+    );
   });
 
   app.get('/api/instagram/accounts', requireAuth, (_req: Request, res: Response) => {
