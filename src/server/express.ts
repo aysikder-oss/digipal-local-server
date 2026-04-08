@@ -79,15 +79,23 @@ async function getCloudSession(cloudUrl: string, email: string, password: string
 }
 
 async function registerHubWithCloud(cloudUrl: string, email: string, password: string, subscriberId: number): Promise<{ hubToken: string; hubId: number } | null> {
-  const syncState = getSyncState();
-  if (syncState?.hub_token) {
-    console.log('[initial-sync] Hub already registered, skipping registration');
-    return { hubToken: syncState.hub_token, hubId: 0 };
-  }
-
   if (isHubRevoked()) {
     console.log('[initial-sync] Hub was revoked — skipping registration');
     return null;
+  }
+
+  const syncState = getSyncState();
+  if (syncState?.hub_token) {
+    if (syncState.subscriber_id === subscriberId && syncState.cloud_url === cloudUrl) {
+      console.log('[initial-sync] Hub already registered for this account, skipping registration');
+      return { hubToken: syncState.hub_token, hubId: 0 };
+    }
+    console.log('[initial-sync] Different account detected — clearing old hub token and re-registering');
+    updateSyncState({ hub_token: null, hub_name: null, subscriber_id: null, cloud_url: null, hub_revoked: 0 });
+    if (cloudSync) {
+      cloudSync.stop();
+      cloudSync = null;
+    }
   }
 
   const hubName = `${os.hostname()} Local Server`;
@@ -107,7 +115,12 @@ async function registerHubWithCloud(cloudUrl: string, email: string, password: s
     }
 
     const result = await res.json();
-    console.log(`[initial-sync] Hub registered successfully — hubId: ${result.hubId}, token: hub_***${result.hubToken?.slice(-6)}`);
+    if (!result.hubToken || typeof result.hubToken !== 'string') {
+      console.error('[initial-sync] Hub registration returned invalid response — missing hubToken');
+      return null;
+    }
+
+    console.log(`[initial-sync] Hub registered successfully — hubId: ${result.hubId}, token: hub_***${result.hubToken.slice(-6)}`);
 
     updateSyncState({
       hub_token: result.hubToken,
@@ -793,6 +806,12 @@ export async function startServer(port: number): Promise<number> {
 
     res.setHeader('Set-Cookie', `session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`);
     res.json({ subscriber: result.subscriber, token: sessionId });
+
+    const syncState = getSyncState();
+    const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
+    runInitialCloudSync(result.subscriber!.id, cloudUrl, email, password).catch(e =>
+      console.error('[auth/login] Cloud sync error:', e.message)
+    );
   });
 
   app.post('/api/auth/logout', (req: Request, res: Response) => {
