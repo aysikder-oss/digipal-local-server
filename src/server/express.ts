@@ -2,6 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import http from 'http';
 import path from 'path';
+import fs from 'fs';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { getDb, getSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount } from '../db/sqlite';
@@ -364,7 +365,16 @@ export async function startServer(port: number): Promise<void> {
   }));
   app.use(cookieParser);
 
-  const frontendPath = path.join(__dirname, '../../dist/public');
+  const distPublicPath = path.join(__dirname, '../../dist/public');
+  const rendererSrc = path.join(__dirname, '../../src/renderer');
+  const rendererRes = process.resourcesPath ? path.join(process.resourcesPath, 'renderer') : '';
+  const frontendPath = fs.existsSync(path.join(distPublicPath, 'index.html'))
+    ? distPublicPath
+    : fs.existsSync(path.join(rendererRes, 'index.html'))
+      ? rendererRes
+      : fs.existsSync(path.join(rendererSrc, 'index.html'))
+        ? rendererSrc
+        : distPublicPath;
   app.use(express.static(frontendPath));
 
   const mediaPath = (() => { try { return getMediaDir(); } catch { return null; } })();
