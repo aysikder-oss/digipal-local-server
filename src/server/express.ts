@@ -568,7 +568,7 @@ export async function startServer(port: number): Promise<number> {
       lastCloudContact: syncState?.last_cloud_contact_at,
       unpushedChanges: unpushedCount,
       hubName: syncState?.hub_name,
-      version: '1.2.1',
+      version: '1.2.2',
       mode: 'local',
       isLocalServer: true,
       cloudUrl,
@@ -2175,18 +2175,30 @@ export async function startServer(port: number): Promise<number> {
       resolve(actualPort);
     };
 
-    const onError = (err: NodeJS.ErrnoException) => {
-      if (err.code === 'EADDRINUSE') {
-        console.log(`[digipal-local] Port ${port} is in use, trying ${port + 1}...`);
-        server!.removeListener('error', onError);
-        server!.listen(port + 1, '0.0.0.0', onListening);
-      } else {
-        reject(err);
-      }
+    let attempts = 0;
+    const maxAttempts = 10;
+
+    const tryPort = (p: number) => {
+      const onError = (err: NodeJS.ErrnoException) => {
+        if (err.code === 'EADDRINUSE') {
+          attempts++;
+          if (attempts >= maxAttempts) {
+            reject(new Error(`All ports ${port}-${port + maxAttempts - 1} are in use. Is another instance already running?`));
+            return;
+          }
+          console.log(`[digipal-local] Port ${p} is in use, trying ${p + 1}...`);
+          server!.removeListener('error', onError);
+          tryPort(p + 1);
+        } else {
+          reject(err);
+        }
+      };
+
+      server!.on('error', onError);
+      server!.listen(p, '0.0.0.0', onListening);
     };
 
-    server!.on('error', onError);
-    server!.listen(port, '0.0.0.0', onListening);
+    tryPort(port);
   });
 }
 
