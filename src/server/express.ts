@@ -6,7 +6,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import os from 'os';
-import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount, getUnpushedChanges, getFullRow, markChangesPushed, upsertRow, withoutTriggers } from '../db/sqlite';
+import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount, getUnpushedChanges, getFullRow, markChangesPushed, upsertRow, withoutTriggers, SYNCED_TABLES } from '../db/sqlite';
 import { startMdns, stopMdns, scanForExistingHubs } from './mdns';
 import { CloudSync } from './cloud-sync';
 import { getConnectedPlayers, registerPlayer, unregisterPlayer, broadcastToPlayers } from './player-bus';
@@ -191,9 +191,11 @@ async function autoSyncOnStartup() {
         const { changes } = await pullRes.json() as { changes: any[] };
         if (Array.isArray(changes) && changes.length > 0) {
           let applied = 0;
+          const allowed = new Set(SYNCED_TABLES);
           withoutTriggers(() => {
             for (const change of changes) {
               if (!change.tableName || typeof change.recordId === 'undefined') continue;
+              if (!allowed.has(change.tableName)) continue;
               try {
                 if (change.operation === 'DELETE') {
                   db.prepare(`DELETE FROM ${change.tableName} WHERE id = ?`).run(change.recordId);
@@ -856,10 +858,15 @@ export async function startServer(port: number): Promise<number> {
       let totalSynced = 0;
       const db = getDb();
 
+      const allowedTables = new Set(SYNCED_TABLES);
       withoutTriggers(() => {
         for (const change of changes) {
           if (!change.tableName || typeof change.recordId === 'undefined') continue;
           const table = change.tableName;
+          if (!allowedTables.has(table)) {
+            console.log(`[cloud-pull] Skipping disallowed table: ${table}`);
+            continue;
+          }
           if (!summary[table]) summary[table] = { added: 0, updated: 0, deleted: 0 };
 
           try {

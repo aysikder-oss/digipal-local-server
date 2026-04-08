@@ -35,6 +35,7 @@ export class CloudSync {
   }
 
   start() {
+    if (this.isRunning) return;
     this.isRunning = true;
     this.connect();
   }
