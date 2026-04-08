@@ -701,6 +701,9 @@ export async function startServer(port: number): Promise<number> {
     '/api/customer/team-screens': '/api/team-screens',
     '/api/customer/team-categories': '/api/team-categories',
     '/api/customer/check-name': '/api/check-name',
+    '/api/customer/licenses': '/api/licenses',
+    '/api/customer/onboarding': '/api/onboarding',
+    '/api/customer/nav-order': '/api/nav-order',
   };
   app.use((req: Request, _res: Response, next: NextFunction) => {
     for (const [prefix, target] of Object.entries(customerPathMap)) {
@@ -777,7 +780,7 @@ export async function startServer(port: number): Promise<number> {
       const teamId = req.query.teamId ? Number(req.query.teamId) : null;
       const screens = await storage.getScreensByOwner(req.session.subscriberId, undefined, teamId);
       res.json(screens);
-    } catch (e: any) { res.status(500).json({ message: e.message }); }
+    } catch (e: any) { console.error('[route] GET /api/screens error:', e); res.status(500).json({ message: e.message }); }
   });
 
   app.get('/api/screens/:id', requireAuth, requirePermission('screens.view'), requireOwnership('screens'), async (req: Request, res: Response) => {
@@ -1044,7 +1047,7 @@ export async function startServer(port: number): Promise<number> {
       const teamId = req.query.teamId ? Number(req.query.teamId) : null;
       const playlists = await storage.getPlaylistsByOwner(req.session.subscriberId, teamId);
       res.json(playlists);
-    } catch (e: any) { res.status(500).json({ message: e.message }); }
+    } catch (e: any) { console.error('[route] GET /api/playlists error:', e); res.status(500).json({ message: e.message }); }
   });
 
   app.get('/api/playlists/:id', requireAuth, requirePermission('playlists.view'), requireOwnership('playlists'), async (req: Request, res: Response) => {
@@ -1121,11 +1124,16 @@ export async function startServer(port: number): Promise<number> {
         const db = getDb();
         const subscriberId = req.session.subscriberId;
         const teamIds = (db.prepare('SELECT team_id FROM team_members WHERE subscriber_id = ?').all(subscriberId) as any[]).map(r => r.team_id);
-        const placeholders = teamIds.length > 0 ? teamIds.map(() => '?').join(',') : 'NULL';
-        const schedules = db.prepare(`SELECT s.* FROM schedules s JOIN screens sc ON s.screen_id = sc.id WHERE sc.owner_id = ? OR sc.team_id IN (${placeholders}) ORDER BY s.created_at DESC`).all(subscriberId, ...teamIds);
-        res.json(schedules);
+        let rows: any[];
+        if (teamIds.length > 0) {
+          const placeholders = teamIds.map(() => '?').join(',');
+          rows = db.prepare(`SELECT s.* FROM schedules s JOIN screens sc ON s.screen_id = sc.id WHERE sc.owner_id = ? OR sc.team_id IN (${placeholders}) ORDER BY s.created_at DESC`).all(subscriberId, ...teamIds);
+        } else {
+          rows = db.prepare(`SELECT s.* FROM schedules s JOIN screens sc ON s.screen_id = sc.id WHERE sc.owner_id = ? ORDER BY s.created_at DESC`).all(subscriberId);
+        }
+        res.json(rows);
       }
-    } catch (e: any) { res.status(500).json({ message: e.message }); }
+    } catch (e: any) { console.error('[route] GET /api/schedules error:', e); res.status(500).json({ message: e.message }); }
   });
 
   app.get('/api/schedules/:id', requireAuth, requirePermission('schedules.view'), requireOwnership('schedules'), async (req: Request, res: Response) => {
@@ -1339,6 +1347,13 @@ export async function startServer(port: number): Promise<number> {
   });
 
   app.get('/api/notifications/unread-count', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const count = await storage.getUnreadNotificationCount({ targetType: 'customer', subscriberId: req.session.subscriberId });
+      res.json({ count });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.get('/api/notifications/count', requireAuth, async (req: Request, res: Response) => {
     try {
       const count = await storage.getUnreadNotificationCount({ targetType: 'customer', subscriberId: req.session.subscriberId });
       res.json({ count });
@@ -1741,6 +1756,22 @@ export async function startServer(port: number): Promise<number> {
       await storage.dismissOnboarding({ targetType: 'customer', subscriberId: req.session.subscriberId });
       res.json({ ok: true });
     } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.get('/api/nav-order', requireAuth, (_req: Request, res: Response) => {
+    res.json([]);
+  });
+
+  app.post('/api/nav-order', requireAuth, (_req: Request, res: Response) => {
+    res.json({ ok: true });
+  });
+
+  app.get('/api/approvals', requireAuth, (_req: Request, res: Response) => {
+    res.json([]);
+  });
+
+  app.get('/api/admin/hubs/subscriber/:id', requireAuth, (req: Request, res: Response) => {
+    res.json({ id: Number(req.params.id), hubs: [] });
   });
 
   app.get('/api/layout-templates', requireAuth, requirePermission('design.view'), async (req: Request, res: Response) => {
