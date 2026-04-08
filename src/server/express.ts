@@ -447,8 +447,8 @@ export async function startServer(port: number): Promise<number> {
 
   app.get('/api/customer/storage', requireAuth, async (_req: Request, res: Response) => {
     try {
-      const usage = getMediaDiskUsage();
-      res.json({ usedMB: Math.round(usage / 1024 / 1024), limitMB: 10240, percentage: Math.round(usage / (10240 * 1024 * 1024) * 100) });
+      const { totalBytes } = getMediaDiskUsage();
+      res.json({ usedMB: Math.round(totalBytes / 1024 / 1024), limitMB: 10240, percentage: Math.round(totalBytes / (10240 * 1024 * 1024) * 100) });
     } catch { res.json({ usedMB: 0, limitMB: 10240, percentage: 0 }); }
   });
 
