@@ -367,10 +367,11 @@ export async function startServer(port: number): Promise<number> {
 
   const distPublicPath = path.join(__dirname, '../../dist/public');
   const rendererSrc = path.join(__dirname, '../../src/renderer');
-  const rendererRes = process.resourcesPath ? path.join(process.resourcesPath, 'renderer') : '';
+  const resPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+  const rendererRes = resPath ? path.join(resPath, 'renderer') : '';
   const frontendPath = fs.existsSync(path.join(distPublicPath, 'index.html'))
     ? distPublicPath
-    : fs.existsSync(path.join(rendererRes, 'index.html'))
+    : (rendererRes && fs.existsSync(path.join(rendererRes, 'index.html')))
       ? rendererRes
       : fs.existsSync(path.join(rendererSrc, 'index.html'))
         ? rendererSrc
