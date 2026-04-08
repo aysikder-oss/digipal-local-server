@@ -179,48 +179,127 @@ async function autoSyncOnStartup() {
   startCloudSyncIfNeeded();
   console.log('[auto-sync] Hub token found — CloudSync WebSocket started');
 
+  const contentCount = (db.prepare('SELECT COUNT(*) as c FROM contents').get() as any)?.c || 0;
   const screenCount = (db.prepare('SELECT COUNT(*) as c FROM screens').get() as any)?.c || 0;
-  if (screenCount === 0 && !syncState.last_sync_at) {
-    console.log('[auto-sync] No local data found — attempting initial REST pull...');
+  if ((contentCount === 0 && screenCount === 0) || !syncState.last_sync_at) {
+    console.log('[auto-sync] No local data or never synced — attempting full data pull...');
     try {
-      const since = new Date(0).toISOString();
-      const pullRes = await fetch(`${syncState.cloud_url}/api/hub/sync/pull?since=${encodeURIComponent(since)}`, {
-        headers: { 'x-hub-token': syncState.hub_token, 'Accept': 'application/json' },
-      });
-      if (pullRes.ok) {
-        const { changes } = await pullRes.json() as { changes: any[] };
-        if (Array.isArray(changes) && changes.length > 0) {
-          let applied = 0;
-          const allowed = new Set(SYNCED_TABLES);
-          withoutTriggers(() => {
-            for (const change of changes) {
-              if (!change.tableName || typeof change.recordId === 'undefined') continue;
-              if (!allowed.has(change.tableName)) continue;
-              try {
-                if (change.operation === 'DELETE') {
-                  db.prepare(`DELETE FROM ${change.tableName} WHERE id = ?`).run(change.recordId);
-                } else {
-                  const data = change.payload ? JSON.parse(change.payload) : {};
-                  if (data.id === undefined) data.id = change.recordId;
-                  upsertRow(change.tableName, data);
-                }
-                applied++;
-              } catch (e: any) {
-                console.log(`[auto-sync] Skipped ${change.tableName}/${change.recordId}: ${e.message}`);
-              }
-            }
-          });
-          updateSyncState({ last_sync_at: new Date().toISOString() });
-          console.log(`[auto-sync] Initial pull complete — applied ${applied} changes`);
-        } else {
-          console.log('[auto-sync] No changes from cloud');
-        }
-      } else {
-        console.log(`[auto-sync] Cloud pull returned ${pullRes.status} — will retry on next sync`);
-      }
+      const totalSynced = await pullFullDataViaHubToken(syncState.cloud_url, syncState.hub_token);
+      console.log(`[auto-sync] Full pull complete — ${totalSynced} rows synced`);
     } catch (e: any) {
-      console.error('[auto-sync] Initial pull failed:', e.message);
+      console.error('[auto-sync] Full pull failed:', e.message);
     }
+  }
+}
+
+const CLOUD_SYNC_ENDPOINTS = [
+  { path: '/api/customer/screens', table: 'screens' },
+  { path: '/api/customer/contents', table: 'contents' },
+  { path: '/api/customer/playlists', table: 'playlists' },
+  { path: '/api/customer/folders', table: 'content_folders' },
+  { path: '/api/customer/schedules', table: 'schedules' },
+  { path: '/api/customer/screen-groups', table: 'screen_groups' },
+  { path: '/api/customer/broadcasts', table: 'broadcasts' },
+  { path: '/api/customer/qr-codes', table: 'smart_qr_codes' },
+  { path: '/api/customer/widgets', table: 'widgets' },
+  { path: '/api/customer/video-walls', table: 'video_walls' },
+  { path: '/api/customer/kiosks', table: 'kiosks' },
+  { path: '/api/customer/smart-triggers', table: 'smart_triggers' },
+];
+
+async function pullAllDataFromCloud(cloudUrl: string, sessionCookie: string, onStep?: (step: string) => void): Promise<number> {
+  const db = getDb();
+  let totalSynced = 0;
+
+  for (const ep of CLOUD_SYNC_ENDPOINTS) {
+    try {
+      onStep?.(`Syncing ${ep.table.replace(/_/g, ' ')}...`);
+      const res = await fetch(`${cloudUrl}${ep.path}`, {
+        headers: { 'Cookie': sessionCookie, 'Accept': 'application/json' },
+      });
+      if (!res.ok) {
+        console.log(`[cloud-pull] ${ep.table}: HTTP ${res.status}`);
+        continue;
+      }
+      const raw = await res.json();
+      const data = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' && Array.isArray(raw.data)) ? raw.data : null;
+      if (!data || data.length === 0) {
+        console.log(`[cloud-pull] ${ep.table}: ${data ? '0 rows' : 'non-array response'}`);
+        continue;
+      }
+
+      withoutTriggers(() => {
+        for (const row of data) {
+          try {
+            if (row && typeof row.id !== 'undefined') {
+              upsertRow(ep.table, row);
+            }
+          } catch (e: any) {
+            console.log(`[cloud-pull] Row error in ${ep.table}: ${e.message}`);
+          }
+        }
+      });
+      totalSynced += data.length;
+      console.log(`[cloud-pull] Synced ${data.length} rows for ${ep.table}`);
+    } catch (e: any) {
+      console.log(`[cloud-pull] Skipped ${ep.table}: ${e.message}`);
+    }
+  }
+
+  updateSyncState({ last_sync_at: new Date().toISOString() });
+  return totalSynced;
+}
+
+const FULL_PULL_TABLE_MAP: Record<string, string> = {
+  screens: 'screens',
+  contents: 'contents',
+  playlists: 'playlists',
+  contentFolders: 'content_folders',
+  schedules: 'schedules',
+  playlistItems: 'playlist_items',
+  videoWalls: 'video_walls',
+  kiosks: 'kiosks',
+};
+
+async function pullFullDataViaHubToken(cloudUrl: string, hubToken: string): Promise<number> {
+  try {
+    const res = await fetch(`${cloudUrl}/api/hub/sync/full-pull`, {
+      headers: { 'x-hub-token': hubToken, 'Accept': 'application/json' },
+    });
+    if (!res.ok) {
+      console.log(`[full-pull] Cloud returned ${res.status}`);
+      return 0;
+    }
+    const data = await res.json() as Record<string, any[]>;
+    const db = getDb();
+    let totalSynced = 0;
+
+    withoutTriggers(() => {
+      for (const [key, rows] of Object.entries(data)) {
+        const tableName = FULL_PULL_TABLE_MAP[key] || key;
+        if (!Array.isArray(rows)) continue;
+        for (const row of rows) {
+          try {
+            if (row && typeof row.id !== 'undefined') {
+              upsertRow(tableName, row);
+              totalSynced++;
+            }
+          } catch (e: any) {
+            console.log(`[full-pull] Row error in ${tableName}: ${e.message}`);
+          }
+        }
+        if (rows.length > 0) {
+          console.log(`[full-pull] Synced ${rows.length} rows for ${tableName}`);
+        }
+      }
+    });
+
+    updateSyncState({ last_sync_at: new Date().toISOString() });
+    console.log(`[full-pull] Complete — ${totalSynced} total rows`);
+    return totalSynced;
+  } catch (e: any) {
+    console.error('[full-pull] Failed:', e.message);
+    return 0;
   }
 }
 
@@ -234,15 +313,6 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
     console.log('[initial-sync] Hub registration failed — continuing with REST-based sync only');
   }
 
-  const db = getDb();
-  const screenCount = (db.prepare('SELECT COUNT(*) as c FROM screens WHERE owner_id = ?').get(subscriberId) as any)?.c || 0;
-  console.log(`[initial-sync] Local screen count for subscriber ${subscriberId}: ${screenCount}`);
-
-  if (screenCount > 0) {
-    initialSyncStatus = { inProgress: false, step: 'Data already synced', error: null, completedAt: new Date().toISOString() };
-    return;
-  }
-
   initialSyncStatus.step = 'Authenticating with cloud...';
 
   const sessionCookie = await getCloudSession(cloudUrl, email, password);
@@ -251,56 +321,11 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
     return;
   }
 
-  console.log('[initial-sync] Cloud session obtained, starting data pull...');
+  console.log('[initial-sync] Cloud session obtained, starting full data pull...');
 
-  const endpoints = [
-    { path: '/api/customer/screens', table: 'screens' },
-    { path: '/api/customer/contents', table: 'contents' },
-    { path: '/api/customer/playlists', table: 'playlists' },
-    { path: '/api/customer/folders', table: 'content_folders' },
-    { path: '/api/customer/schedules', table: 'schedules' },
-    { path: '/api/customer/screen-groups', table: 'screen_groups' },
-    { path: '/api/customer/broadcasts', table: 'broadcasts' },
-    { path: '/api/customer/qr-codes', table: 'smart_qr_codes' },
-    { path: '/api/customer/widgets', table: 'widgets' },
-    { path: '/api/customer/video-walls', table: 'video_walls' },
-  ];
-
-  let totalSynced = 0;
-  for (const ep of endpoints) {
-    try {
-      initialSyncStatus.step = `Syncing ${ep.table.replace(/_/g, ' ')}...`;
-      const res = await fetch(`${cloudUrl}${ep.path}`, {
-        headers: { 'Cookie': sessionCookie, 'Accept': 'application/json' },
-      });
-      if (!res.ok) {
-        console.log(`[initial-sync] ${ep.table}: HTTP ${res.status}`);
-        continue;
-      }
-      const raw = await res.json();
-      const data = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' && Array.isArray(raw.data)) ? raw.data : null;
-      if (!data || data.length === 0) {
-        console.log(`[initial-sync] ${ep.table}: ${data ? '0 rows' : 'non-array response'}`);
-        continue;
-      }
-
-      withoutTriggers(() => {
-        for (const row of data) {
-          try {
-            if (row && typeof row.id !== 'undefined') {
-              upsertRow(ep.table, row);
-            }
-          } catch (e: any) {
-            console.log(`[initial-sync] Row error in ${ep.table}: ${e.message}`);
-          }
-        }
-      });
-      totalSynced += data.length;
-      console.log(`[initial-sync] Synced ${data.length} rows for ${ep.table}`);
-    } catch (e: any) {
-      console.log(`[initial-sync] Skipped ${ep.table}: ${e.message}`);
-    }
-  }
+  const totalSynced = await pullAllDataFromCloud(cloudUrl, sessionCookie, (step) => {
+    initialSyncStatus.step = step;
+  });
 
   initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
   console.log(`[initial-sync] Initial cloud data sync complete — ${totalSynced} total rows`);
@@ -827,10 +852,11 @@ export async function startServer(port: number): Promise<number> {
     res.json({ syncEnabled: shouldEnable, message: shouldEnable ? 'Cloud sync enabled' : 'Cloud sync disabled' });
   });
 
-  app.post('/api/customer/cloud-sync/pull', requireAuth, async (_req: Request, res: Response) => {
+  app.post('/api/customer/cloud-sync/pull', requireAuth, async (req: Request, res: Response) => {
     const syncState = getSyncState();
     const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
     const hubToken = syncState?.hub_token;
+    const fullSync = req.query.full === 'true' || req.body?.full === true;
 
     if (!hubToken) {
       return res.status(400).json({ message: 'No hub token — please log in to register this hub first.' });
@@ -849,9 +875,15 @@ export async function startServer(port: number): Promise<number> {
 
       const { changes } = await pullRes.json() as { changes: Array<{ tableName: string; recordId: number; operation: string; payload?: string }> };
 
-      if (!Array.isArray(changes) || changes.length === 0) {
-        updateSyncState({ last_sync_at: new Date().toISOString() });
-        return res.json({ message: 'No new changes from cloud', totalSynced: 0, summary: {} });
+      const hasIncrementalChanges = Array.isArray(changes) && changes.length > 0;
+
+      if (!hasIncrementalChanges || fullSync) {
+        console.log(`[cloud-pull] ${fullSync ? 'Full sync requested' : 'No incremental changes'} — performing full data pull via hub token...`);
+        const totalSynced = await pullFullDataViaHubToken(cloudUrl, hubToken);
+        if (totalSynced > 0) {
+          broadcastToPlayers({ type: 'contentUpdated', payload: {} });
+        }
+        return res.json({ message: `Full sync complete — ${totalSynced} items synced`, totalSynced, summary: {} });
       }
 
       const summary: Record<string, { added: number; updated: number; deleted: number }> = {};
