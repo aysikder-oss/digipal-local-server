@@ -754,14 +754,11 @@ export async function startServer(port: number): Promise<number> {
     try {
       const { ids } = req.body;
       if (!Array.isArray(ids)) return res.status(400).json({ message: 'ids array required' });
-      const subscriberId = req.session.subscriberId;
-      const teamIds = req.session.teamMemberships?.map((m: any) => m.teamId) || [];
       let deleted = 0;
       for (const id of ids) {
         const content = await storage.getContent(Number(id));
         if (!content) continue;
-        const ownerId = (content as any).owner_id || (content as any).subscriber_id;
-        if (ownerId !== subscriberId && !teamIds.includes(ownerId)) continue;
+        if (!assertOwnership(content as unknown as OwnableRow, req.session.subscriberId)) continue;
         if (content?.localPath) deleteLocalFile(path.basename(content.localPath));
         await storage.deleteContent(Number(id));
         deleted++;
@@ -774,15 +771,12 @@ export async function startServer(port: number): Promise<number> {
     try {
       const { ids, folderId } = req.body;
       if (!Array.isArray(ids)) return res.status(400).json({ message: 'ids array required' });
-      const subscriberId = req.session.subscriberId;
-      const teamIds = req.session.teamMemberships?.map((m: any) => m.teamId) || [];
       const db = getDb();
       let moved = 0;
       for (const id of ids) {
         const content = await storage.getContent(Number(id));
         if (!content) continue;
-        const ownerId = (content as any).owner_id || (content as any).subscriber_id;
-        if (ownerId !== subscriberId && !teamIds.includes(ownerId)) continue;
+        if (!assertOwnership(content as unknown as OwnableRow, req.session.subscriberId)) continue;
         db.prepare('UPDATE contents SET folder_id = ? WHERE id = ?').run(folderId ?? null, Number(id));
         moved++;
       }
