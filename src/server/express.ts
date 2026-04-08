@@ -5,7 +5,8 @@ import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-import { getDb, getSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount, upsertRow, withoutTriggers } from '../db/sqlite';
+import os from 'os';
+import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount, upsertRow, withoutTriggers } from '../db/sqlite';
 import { startMdns, stopMdns, scanForExistingHubs } from './mdns';
 import { CloudSync } from './cloud-sync';
 import { getConnectedPlayers, registerPlayer, unregisterPlayer, broadcastToPlayers } from './player-bus';
@@ -77,7 +78,72 @@ async function getCloudSession(cloudUrl: string, email: string, password: string
   }
 }
 
+async function registerHubWithCloud(cloudUrl: string, email: string, password: string, subscriberId: number): Promise<{ hubToken: string; hubId: number } | null> {
+  const syncState = getSyncState();
+  if (syncState?.hub_token) {
+    console.log('[initial-sync] Hub already registered, skipping registration');
+    return { hubToken: syncState.hub_token, hubId: 0 };
+  }
+
+  if (isHubRevoked()) {
+    console.log('[initial-sync] Hub was revoked — skipping registration');
+    return null;
+  }
+
+  const hubName = `${os.hostname()} Local Server`;
+  console.log(`[initial-sync] Registering hub "${hubName}" with cloud at ${cloudUrl}/api/hub/register`);
+
+  try {
+    const res = await fetch(`${cloudUrl}/api/hub/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, name: hubName }),
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.error(`[initial-sync] Hub registration failed: HTTP ${res.status} — ${body.substring(0, 200)}`);
+      return null;
+    }
+
+    const result = await res.json();
+    console.log(`[initial-sync] Hub registered successfully — hubId: ${result.hubId}, token: hub_***${result.hubToken?.slice(-6)}`);
+
+    updateSyncState({
+      hub_token: result.hubToken,
+      cloud_url: cloudUrl,
+      subscriber_id: subscriberId,
+      hub_name: hubName,
+      hub_revoked: 0,
+    });
+
+    return { hubToken: result.hubToken, hubId: result.hubId };
+  } catch (e: any) {
+    console.error('[initial-sync] Hub registration error:', e.message);
+    return null;
+  }
+}
+
+function startCloudSyncIfNeeded() {
+  if (cloudSync) return;
+  const syncState = getSyncState();
+  if (syncState?.hub_token && syncState?.cloud_url && !isHubRevoked()) {
+    console.log('[initial-sync] Starting CloudSync WebSocket...');
+    cloudSync = new CloudSync(syncState.cloud_url, syncState.hub_token);
+    cloudSync.start();
+  }
+}
+
 async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email: string, password: string) {
+  initialSyncStatus = { inProgress: true, step: 'Registering with cloud...', error: null, completedAt: null };
+
+  const hubResult = await registerHubWithCloud(cloudUrl, email, password, subscriberId);
+  if (hubResult) {
+    startCloudSyncIfNeeded();
+  } else {
+    console.log('[initial-sync] Hub registration failed — continuing with REST-based sync only');
+  }
+
   const db = getDb();
   const screenCount = (db.prepare('SELECT COUNT(*) as c FROM screens WHERE owner_id = ?').get(subscriberId) as any)?.c || 0;
   console.log(`[initial-sync] Local screen count for subscriber ${subscriberId}: ${screenCount}`);
@@ -87,7 +153,7 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
     return;
   }
 
-  initialSyncStatus = { inProgress: true, step: 'Authenticating with cloud...', error: null, completedAt: null };
+  initialSyncStatus.step = 'Authenticating with cloud...';
 
   const sessionCookie = await getCloudSession(cloudUrl, email, password);
   if (!sessionCookie) {
