@@ -15,7 +15,7 @@ jobs:
         with:
           node-version: 20
       - name: Clone cloud frontend
-        run: git clone --depth 1 https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/aysikder-oss/Digipal-SignageSoftware-Replit-FIles.git ../cloud-app
+        run: git clone --depth 1 https://x-access-token:${{ secrets.CLOUD_REPO_PAT }}@github.com/aysikder-oss/Digipal-SignageSoftware-Replit-FIles.git ../cloud-app
       - name: Install frontend dependencies
         run: cd ../cloud-app && npm install --ignore-scripts
       - name: Build frontend
