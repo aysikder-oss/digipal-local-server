@@ -156,23 +156,70 @@ async function autoSyncOnStartup() {
     return;
   }
 
-  if (syncState.hub_token && syncState.cloud_url && !isHubRevoked()) {
-    if (syncState.sync_enabled === 0) {
-      console.log('[auto-sync] Hub token found but sync disabled by user preference — skipping');
-      return;
+  if (!syncState.hub_token || !syncState.cloud_url) {
+    const activeSessions = db.prepare('SELECT * FROM sessions WHERE expires_at > ? ORDER BY expires_at DESC LIMIT 1').all(Date.now()) as any[];
+    if (activeSessions.length > 0) {
+      console.log('[auto-sync] Active session exists but no hub token — user needs to re-login to register hub');
+    } else {
+      console.log('[auto-sync] No hub token and no active sessions — needs fresh login');
     }
-    startCloudSyncIfNeeded();
-    console.log('[auto-sync] Hub token found — CloudSync WebSocket started');
     return;
   }
 
-  const activeSessions = db.prepare('SELECT * FROM sessions WHERE expires_at > ? ORDER BY expires_at DESC LIMIT 1').all(Date.now()) as any[];
-  if (activeSessions.length === 0) {
-    console.log('[auto-sync] No active sessions and no hub token — needs fresh login');
+  if (isHubRevoked()) {
+    console.log('[auto-sync] Hub is revoked — skipping startup sync');
     return;
   }
 
-  console.log('[auto-sync] Active session exists but no hub token — user needs to re-login to register hub');
+  if (syncState.sync_enabled === 0) {
+    console.log('[auto-sync] Hub token found but sync disabled by user preference — skipping');
+    return;
+  }
+
+  startCloudSyncIfNeeded();
+  console.log('[auto-sync] Hub token found — CloudSync WebSocket started');
+
+  const screenCount = (db.prepare('SELECT COUNT(*) as c FROM screens').get() as any)?.c || 0;
+  if (screenCount === 0 && !syncState.last_sync_at) {
+    console.log('[auto-sync] No local data found — attempting initial REST pull...');
+    try {
+      const since = new Date(0).toISOString();
+      const pullRes = await fetch(`${syncState.cloud_url}/api/hub/sync/pull?since=${encodeURIComponent(since)}`, {
+        headers: { 'x-hub-token': syncState.hub_token, 'Accept': 'application/json' },
+      });
+      if (pullRes.ok) {
+        const { changes } = await pullRes.json() as { changes: any[] };
+        if (Array.isArray(changes) && changes.length > 0) {
+          let applied = 0;
+          withoutTriggers(() => {
+            for (const change of changes) {
+              if (!change.tableName || typeof change.recordId === 'undefined') continue;
+              try {
+                if (change.operation === 'DELETE') {
+                  db.prepare(`DELETE FROM ${change.tableName} WHERE id = ?`).run(change.recordId);
+                } else {
+                  const data = change.payload ? JSON.parse(change.payload) : {};
+                  if (data.id === undefined) data.id = change.recordId;
+                  upsertRow(change.tableName, data);
+                }
+                applied++;
+              } catch (e: any) {
+                console.log(`[auto-sync] Skipped ${change.tableName}/${change.recordId}: ${e.message}`);
+              }
+            }
+          });
+          updateSyncState({ last_sync_at: new Date().toISOString() });
+          console.log(`[auto-sync] Initial pull complete — applied ${applied} changes`);
+        } else {
+          console.log('[auto-sync] No changes from cloud');
+        }
+      } else {
+        console.log(`[auto-sync] Cloud pull returned ${pullRes.status} — will retry on next sync`);
+      }
+    } catch (e: any) {
+      console.error('[auto-sync] Initial pull failed:', e.message);
+    }
+  }
 }
 
 async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email: string, password: string) {
@@ -778,98 +825,94 @@ export async function startServer(port: number): Promise<number> {
     res.json({ syncEnabled: shouldEnable, message: shouldEnable ? 'Cloud sync enabled' : 'Cloud sync disabled' });
   });
 
-  app.post('/api/customer/cloud-sync/pull', requireAuth, async (req: Request, res: Response) => {
+  app.post('/api/customer/cloud-sync/pull', requireAuth, async (_req: Request, res: Response) => {
     const syncState = getSyncState();
     const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
+    const hubToken = syncState?.hub_token;
 
-    const { email, password } = req.body;
-    let sessionCookie: string | null = null;
+    if (!hubToken) {
+      return res.status(400).json({ message: 'No hub token — please log in to register this hub first.' });
+    }
 
-    if (email && password) {
-      sessionCookie = await getCloudSession(cloudUrl, email, password);
-    } else {
+    try {
+      const since = syncState?.last_sync_at || new Date(0).toISOString();
+      const pullRes = await fetch(`${cloudUrl}/api/hub/sync/pull?since=${encodeURIComponent(since)}`, {
+        headers: { 'x-hub-token': hubToken, 'Accept': 'application/json' },
+      });
+
+      if (!pullRes.ok) {
+        const err = await pullRes.json().catch(() => ({ message: 'Unknown error' }));
+        return res.status(pullRes.status).json({ message: err.message || 'Cloud pull failed' });
+      }
+
+      const { changes } = await pullRes.json() as { changes: Array<{ tableName: string; recordId: number; operation: string; payload?: string }> };
+
+      if (!Array.isArray(changes) || changes.length === 0) {
+        updateSyncState({ last_sync_at: new Date().toISOString() });
+        return res.json({ message: 'No new changes from cloud', totalSynced: 0, summary: {} });
+      }
+
+      const summary: Record<string, { added: number; updated: number; deleted: number }> = {};
+      let totalSynced = 0;
       const db = getDb();
-      const sub = db.prepare('SELECT email, password_hash FROM subscribers WHERE id = ?').get(req.session.subscriberId) as any;
-      if (sub?.email) {
-        sessionCookie = await getCloudSession(cloudUrl, sub.email, '').catch(() => null);
-      }
-    }
 
-    if (!sessionCookie) {
-      return res.status(400).json({ message: 'Could not authenticate with cloud. Please provide email and password.' });
-    }
+      withoutTriggers(() => {
+        for (const change of changes) {
+          if (!change.tableName || typeof change.recordId === 'undefined') continue;
+          const table = change.tableName;
+          if (!summary[table]) summary[table] = { added: 0, updated: 0, deleted: 0 };
 
-    const endpoints = [
-      { path: '/api/customer/screens', table: 'screens' },
-      { path: '/api/customer/contents', table: 'contents' },
-      { path: '/api/customer/playlists', table: 'playlists' },
-      { path: '/api/customer/folders', table: 'content_folders' },
-      { path: '/api/customer/schedules', table: 'schedules' },
-      { path: '/api/customer/screen-groups', table: 'screen_groups' },
-      { path: '/api/customer/broadcasts', table: 'broadcasts' },
-      { path: '/api/customer/qr-codes', table: 'smart_qr_codes' },
-      { path: '/api/customer/widgets', table: 'widgets' },
-      { path: '/api/customer/video-walls', table: 'video_walls' },
-    ];
-
-    const summary: Record<string, { added: number; updated: number }> = {};
-    let totalSynced = 0;
-
-    for (const ep of endpoints) {
-      try {
-        const fetchRes = await fetch(`${cloudUrl}${ep.path}`, {
-          headers: { 'Cookie': sessionCookie, 'Accept': 'application/json' },
-        });
-        if (!fetchRes.ok) continue;
-        const raw = await fetchRes.json();
-        const data = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' && Array.isArray(raw.data)) ? raw.data : null;
-        if (!data || data.length === 0) continue;
-
-        let added = 0, updated = 0;
-        const db = getDb();
-        withoutTriggers(() => {
-          for (const row of data) {
-            if (!row || typeof row.id === 'undefined') continue;
-            const existing = db.prepare(`SELECT id FROM ${ep.table} WHERE id = ?`).get(row.id);
-            upsertRow(ep.table, row);
-            if (existing) updated++; else added++;
+          try {
+            if (change.operation === 'DELETE') {
+              db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(change.recordId);
+              summary[table].deleted++;
+            } else {
+              const data = change.payload ? JSON.parse(change.payload) : {};
+              if (data.id === undefined) data.id = change.recordId;
+              const existing = db.prepare(`SELECT id FROM ${table} WHERE id = ?`).get(change.recordId);
+              upsertRow(table, data);
+              if (existing) summary[table].updated++; else summary[table].added++;
+            }
+            totalSynced++;
+          } catch (e: any) {
+            console.log(`[cloud-pull] Skipped ${table}/${change.recordId}: ${e.message}`);
           }
-        });
-        summary[ep.table] = { added, updated };
-        totalSynced += added + updated;
-      } catch (e: any) {
-        console.log(`[cloud-pull] Skipped ${ep.table}: ${e.message}`);
-      }
-    }
+        }
+      });
 
-    if (totalSynced > 0) {
       updateSyncState({ last_sync_at: new Date().toISOString() });
-      broadcastToPlayers({ type: 'contentUpdated', payload: {} });
-    }
+      if (totalSynced > 0) {
+        broadcastToPlayers({ type: 'contentUpdated', payload: {} });
+      }
 
-    res.json({ message: `Pulled ${totalSynced} records from cloud`, summary, totalSynced });
+      res.json({ message: `Pulled ${totalSynced} changes from cloud`, summary, totalSynced });
+    } catch (e: any) {
+      console.error('[cloud-pull] Error:', e.message);
+      res.status(500).json({ message: `Pull failed: ${e.message}` });
+    }
   });
 
-  app.post('/api/customer/cloud-sync/push', requireAuth, (_req: Request, res: Response) => {
+  app.post('/api/customer/cloud-sync/push', requireAuth, async (_req: Request, res: Response) => {
     const unpushed = getUnpushedChanges();
     if (unpushed.length === 0) {
       return res.json({ message: 'No local changes to push', totalPushed: 0 });
     }
 
-    if (cloudSync?.isConnected()) {
-      const changes = unpushed.map((change: any) => {
-        const row = change.operation !== 'DELETE'
-          ? getFullRow(change.table_name, change.record_id)
-          : null;
-        return {
-          id: change.id,
-          tableName: change.table_name,
-          recordId: change.record_id,
-          operation: change.operation,
-          data: row || JSON.parse(change.payload || '{}'),
-        };
-      });
+    const changes = unpushed.map((change: any) => {
+      const row = change.operation !== 'DELETE'
+        ? getFullRow(change.table_name, change.record_id)
+        : null;
+      return {
+        id: change.id,
+        tableName: change.table_name,
+        recordId: change.record_id,
+        operation: change.operation,
+        data: row || JSON.parse(change.payload || '{}'),
+        payload: change.payload || JSON.stringify(row || {}),
+      };
+    });
 
+    if (cloudSync?.isConnected()) {
       const sent = cloudSync.sendMessage({
         type: 'hubSyncPush',
         payload: { changes },
@@ -878,12 +921,37 @@ export async function startServer(port: number): Promise<number> {
       if (sent) {
         const ids = unpushed.map((c: any) => c.id);
         markChangesPushed(ids);
-        res.json({ message: `Pushed ${changes.length} changes to cloud`, totalPushed: changes.length });
-      } else {
-        res.status(503).json({ message: 'WebSocket connection lost during send. Please retry.' });
+        return res.json({ message: `Pushed ${changes.length} changes to cloud via WebSocket`, totalPushed: changes.length });
       }
-    } else {
-      res.status(400).json({ message: 'Cloud sync is not connected. Enable sync first.' });
+    }
+
+    const syncState = getSyncState();
+    const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
+    const hubToken = syncState?.hub_token;
+
+    if (!hubToken) {
+      return res.status(400).json({ message: 'No hub token — please log in to register this hub first.' });
+    }
+
+    try {
+      const pushRes = await fetch(`${cloudUrl}/api/hub/sync/push`, {
+        method: 'POST',
+        headers: { 'x-hub-token': hubToken, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ changes }),
+      });
+
+      if (!pushRes.ok) {
+        const err = await pushRes.json().catch(() => ({ message: 'Unknown error' }));
+        return res.status(pushRes.status).json({ message: err.message || 'Cloud push failed' });
+      }
+
+      const result = await pushRes.json();
+      const ids = unpushed.map((c: any) => c.id);
+      markChangesPushed(ids);
+      res.json({ message: `Pushed ${result.applied || changes.length} changes to cloud via REST`, totalPushed: result.applied || changes.length });
+    } catch (e: any) {
+      console.error('[cloud-push] REST fallback error:', e.message);
+      res.status(500).json({ message: `Push failed: ${e.message}` });
     }
   });
 
