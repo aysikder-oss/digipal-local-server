@@ -412,9 +412,33 @@ export async function startServer(port: number): Promise<number> {
     if (!sub) return res.status(401).json({ message: 'Session expired' });
     const perms = resolvePermissions(sub.id);
     const role = (sub as any).account_role || (sub as any).accountRole || 'viewer';
+    const now = new Date().toISOString();
     res.json({
       ...sub,
       accountRole: role,
+      consentTosAt: (sub as any).consentTosAt || now,
+      consentPrivacyAt: (sub as any).consentPrivacyAt || now,
+      workspace: {
+        teamId: null,
+        teamName: null,
+        role: role,
+        permissions: perms,
+        isOwner: role === 'owner',
+      },
+    });
+  });
+
+  app.post('/api/customer/accept-terms', requireAuth, async (req: Request, res: Response) => {
+    const sub = getSessionSubscriber(req.session.subscriberId);
+    if (!sub) return res.status(401).json({ message: 'Session expired' });
+    const now = new Date().toISOString();
+    const perms = resolvePermissions(sub.id);
+    const role = (sub as any).account_role || (sub as any).accountRole || 'viewer';
+    res.json({
+      ...sub,
+      accountRole: role,
+      consentTosAt: now,
+      consentPrivacyAt: now,
       workspace: {
         teamId: null,
         teamName: null,
