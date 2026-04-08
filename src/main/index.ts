@@ -16,11 +16,11 @@ function setupAutoUpdater(): void {
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
 
-  autoUpdater.on('update-available', (info) => {
+  autoUpdater.on('update-available', (info: any) => {
     console.log(`[updater] Update available: v${info.version}`);
   });
 
-  autoUpdater.on('update-downloaded', (info) => {
+  autoUpdater.on('update-downloaded', (info: any) => {
     console.log(`[updater] Update downloaded: v${info.version}`);
     dialog.showMessageBox(mainWindow!, {
       type: 'info',
@@ -36,7 +36,7 @@ function setupAutoUpdater(): void {
     });
   });
 
-  autoUpdater.on('error', (err) => {
+  autoUpdater.on('error', (err: any) => {
     console.log('[updater] Auto-update error:', err.message);
   });
 

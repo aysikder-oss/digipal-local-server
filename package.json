@@ -59,6 +59,11 @@
       "runAfterFinish": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "aysikder-oss",
+      "repo": "digipal-local-server"
     }
   },
   "dependencies": {
@@ -68,6 +73,7 @@
     "express": "^4.21.0",
     "ws": "^8.18.0",
     "electron-store": "^8.2.0",
+    "electron-updater": "^6.3.9",
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
