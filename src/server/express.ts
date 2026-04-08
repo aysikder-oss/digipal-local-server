@@ -1185,7 +1185,7 @@ export async function startServer(port: number): Promise<number> {
       lastCloudContact: syncState?.last_cloud_contact_at,
       unpushedChanges: unpushedCount,
       hubName: syncState?.hub_name,
-      version: '1.2.2',
+      version: '1.2.14',
       mode: 'local',
       isLocalServer: true,
       cloudUrl,
