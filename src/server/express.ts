@@ -342,7 +342,7 @@ function parseMultipart(fieldName: string) {
   };
 }
 
-export async function startServer(port: number): Promise<void> {
+export async function startServer(port: number): Promise<number> {
   initSessionTable();
   cleanExpiredSessions();
   sessionCleanupInterval = setInterval(() => cleanExpiredSessions(), 60 * 60 * 1000);
@@ -1957,14 +1957,15 @@ export async function startServer(port: number): Promise<void> {
     });
   });
 
-  return new Promise((resolve) => {
-    server!.listen(port, '0.0.0.0', () => {
-      console.log(`[digipal-local] Server running on port ${port}`);
+  return new Promise((resolve, reject) => {
+    const onListening = () => {
+      const actualPort = (server!.address() as { port: number }).port;
+      console.log(`[digipal-local] Server running on port ${actualPort}`);
 
       const syncState = getSyncState();
       const hubName = syncState?.hub_name;
 
-      startMdns(port, hubName);
+      startMdns(actualPort, hubName);
 
       if (syncState?.hub_token && syncState?.cloud_url && !isHubRevoked()) {
         cloudSync = new CloudSync(syncState.cloud_url, syncState.hub_token);
@@ -1973,8 +1974,21 @@ export async function startServer(port: number): Promise<void> {
         console.log('[digipal-local] Hub is revoked — cloud sync disabled');
       }
 
-      resolve();
-    });
+      resolve(actualPort);
+    };
+
+    const onError = (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE') {
+        console.log(`[digipal-local] Port ${port} is in use, trying ${port + 1}...`);
+        server!.removeListener('error', onError);
+        server!.listen(port + 1, '0.0.0.0', onListening);
+      } else {
+        reject(err);
+      }
+    };
+
+    server!.on('error', onError);
+    server!.listen(port, '0.0.0.0', onListening);
   });
 }
 

@@ -8,7 +8,7 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 
-const SERVER_PORT = 8787;
+let SERVER_PORT = 8787;
 const CLOUD_URL = process.env.CLOUD_URL || 'https://app.digipal.io';
 
 function createWindow() {
@@ -109,7 +109,8 @@ app.whenReady().then(async () => {
     console.log('[startup] Hub blocked — existing hub found on network. Dashboard will show blocked state.');
   }
 
-  await startServer(SERVER_PORT);
+  const actualPort = await startServer(SERVER_PORT);
+  SERVER_PORT = actualPort;
   createWindow();
   createTray();
 
