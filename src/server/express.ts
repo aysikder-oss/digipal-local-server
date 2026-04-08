@@ -151,41 +151,24 @@ async function autoSyncOnStartup() {
   const db = getDb();
   const syncState = getSyncState();
 
-  if (syncState?.hub_token && syncState?.last_sync_at) {
-    console.log('[auto-sync] Hub already registered and data synced — skipping startup sync');
+  if (!syncState) {
+    console.log('[auto-sync] No sync state — skipping startup sync');
+    return;
+  }
+
+  if (syncState.hub_token && syncState.cloud_url && !isHubRevoked()) {
+    startCloudSyncIfNeeded();
+    console.log('[auto-sync] Hub token found — CloudSync WebSocket started');
     return;
   }
 
   const activeSessions = db.prepare('SELECT * FROM sessions WHERE expires_at > ? ORDER BY expires_at DESC LIMIT 1').all(Date.now()) as any[];
   if (activeSessions.length === 0) {
-    console.log('[auto-sync] No active sessions found — skipping startup sync');
+    console.log('[auto-sync] No active sessions and no hub token — needs fresh login');
     return;
   }
 
-  const session = activeSessions[0];
-  const subscriber = db.prepare('SELECT * FROM subscribers WHERE id = ?').get(session.subscriber_id) as any;
-  if (!subscriber || !subscriber.password_hash) {
-    console.log('[auto-sync] No subscriber with cached credentials — skipping startup sync');
-    return;
-  }
-
-  const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
-  console.log(`[auto-sync] Found existing session for subscriber ${subscriber.id} — triggering cloud sync`);
-
-  const cloudLoginRes = await fetch(`${cloudUrl}/api/customer/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: subscriber.email, password: '' }),
-  }).catch(() => null);
-
-  if (!cloudLoginRes || !cloudLoginRes.ok) {
-    console.log('[auto-sync] Cannot authenticate with cloud using cached credentials — sync requires fresh login');
-    return;
-  }
-
-  runInitialCloudSync(subscriber.id, cloudUrl, subscriber.email, '').catch(e =>
-    console.error('[auto-sync] Sync error:', e.message)
-  );
+  console.log('[auto-sync] Active session exists but no hub token — user needs to re-login to register hub');
 }
 
 async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email: string, password: string) {
@@ -309,33 +292,38 @@ declare module 'express-serve-static-core' {
 }
 
 function resolvePermissions(subscriberId: number): PermissionKey[] {
-  const db = getDb();
-  const sub = db.prepare('SELECT account_role FROM subscribers WHERE id = ?').get(subscriberId) as { account_role: string } | undefined;
-  if (!sub) return [];
-  if (sub.account_role === 'owner') return [...ALL_PERMISSIONS];
+  try {
+    const db = getDb();
+    const sub = db.prepare('SELECT account_role FROM subscribers WHERE id = ?').get(subscriberId) as { account_role: string } | undefined;
+    if (!sub) return [...ALL_PERMISSIONS];
+    if (sub.account_role === 'owner' || !sub.account_role) return [...ALL_PERMISSIONS];
 
-  const membership = db.prepare(`
-    SELECT tm.role_id, tr.permissions FROM team_members tm
-    LEFT JOIN team_roles tr ON tr.id = tm.role_id
-    WHERE tm.subscriber_id = ?
-  `).all(subscriberId) as Array<{ role_id: number | null; permissions: string | null }>;
+    const membership = db.prepare(`
+      SELECT tm.role_id, tr.permissions FROM team_members tm
+      LEFT JOIN team_roles tr ON tr.id = tm.role_id
+      WHERE tm.subscriber_id = ?
+    `).all(subscriberId) as Array<{ role_id: number | null; permissions: string | null }>;
 
-  const permSet = new Set<PermissionKey>();
-  permSet.add('content.view');
-  permSet.add('screens.view');
-  permSet.add('playlists.view');
-  permSet.add('schedules.view');
+    const permSet = new Set<PermissionKey>();
+    permSet.add('content.view');
+    permSet.add('screens.view');
+    permSet.add('playlists.view');
+    permSet.add('schedules.view');
 
-  for (const m of membership) {
-    if (m.permissions) {
-      try {
-        const perms = JSON.parse(m.permissions) as PermissionKey[];
-        perms.forEach(p => permSet.add(p));
-      } catch { /* ignore invalid JSON */ }
+    for (const m of membership) {
+      if (m.permissions) {
+        try {
+          const perms = JSON.parse(m.permissions) as PermissionKey[];
+          perms.forEach(p => permSet.add(p));
+        } catch { /* ignore invalid JSON */ }
+      }
     }
-  }
 
-  return Array.from(permSet);
+    return Array.from(permSet);
+  } catch (e: any) {
+    console.error('[resolvePermissions] Error:', e.message);
+    return [...ALL_PERMISSIONS];
+  }
 }
 
 function sessionMiddleware(req: Request, _res: Response, next: NextFunction) {
