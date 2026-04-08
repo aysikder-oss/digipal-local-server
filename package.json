@@ -1,6 +1,6 @@
 {
   "name": "digipal-local-server",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "description": "Digipal On-Premise Local Server",
   "main": "dist/main/index.js",
   "scripts": {
@@ -51,6 +51,13 @@
       ],
       "icon": "build/icon.png"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "aysikder-oss",
+        "repo": "digipal-local-server"
+      }
+    ],
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
@@ -65,6 +72,7 @@
     "better-sqlite3": "^11.0.0",
     "bonjour-service": "^1.2.1",
     "cors": "^2.8.5",
+    "electron-updater": "^6.1.0",
     "express": "^4.21.0",
     "ws": "^8.18.0",
     "electron-store": "^8.2.0",

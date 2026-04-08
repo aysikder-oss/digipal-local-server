@@ -1,5 +1,6 @@
-import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell } from 'electron';
+import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell, dialog } from 'electron';
 import path from 'path';
+import { autoUpdater } from 'electron-updater';
 import { startServer, stopServer, setHubBlocked, setDiscoveredHubs } from '../server/express';
 import { initDatabase, getSyncState } from '../db/sqlite';
 import { scanForExistingHubs } from '../server/mdns';
@@ -10,6 +11,38 @@ let isQuitting = false;
 
 let SERVER_PORT = 8787;
 const CLOUD_URL = process.env.CLOUD_URL || 'https://digipalsignage.com';
+
+function setupAutoUpdater(): void {
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('update-available', (info) => {
+    console.log(`[updater] Update available: v${info.version}`);
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    console.log(`[updater] Update downloaded: v${info.version}`);
+    dialog.showMessageBox(mainWindow!, {
+      type: 'info',
+      title: 'Update Ready',
+      message: `Digipal Local Server v${info.version} has been downloaded.`,
+      detail: 'The update will be installed when you restart the app.',
+      buttons: ['Restart Now', 'Later'],
+    }).then((result) => {
+      if (result.response === 0) {
+        isQuitting = true;
+        autoUpdater.quitAndInstall();
+      }
+    });
+  });
+
+  autoUpdater.on('error', (err) => {
+    console.log('[updater] Auto-update error:', err.message);
+  });
+
+  autoUpdater.checkForUpdatesAndNotify();
+  setInterval(() => autoUpdater.checkForUpdatesAndNotify(), 4 * 60 * 60 * 1000);
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -125,6 +158,7 @@ if (!gotTheLock) {
     SERVER_PORT = actualPort;
     createWindow();
     createTray();
+    setupAutoUpdater();
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) {
