@@ -8,13 +8,23 @@ import {
   upsertRow,
   deleteRow,
   withoutTriggers,
+  getSyncState,
+  setHubRevoked,
+  updateCloudContactTime,
+  enforceLocalFreeScreenLimit,
 } from '../db/sqlite';
+import { broadcastToPlayers } from './player-bus';
+
+const STANDARD_SYNC_INTERVAL = 60 * 60 * 1000;
+const LAZY_SYNC_INTERVAL = 24 * 60 * 60 * 1000;
 
 export class CloudSync {
   private ws: WebSocket | null = null;
   private cloudUrl: string;
   private hubToken: string;
   private heartbeatInterval: NodeJS.Timeout | null = null;
+  private standardSyncInterval: NodeJS.Timeout | null = null;
+  private lazySyncInterval: NodeJS.Timeout | null = null;
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private isRunning = false;
   private pushAckPending = new Set<number>();
@@ -32,6 +42,8 @@ export class CloudSync {
   stop() {
     this.isRunning = false;
     if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+    if (this.standardSyncInterval) clearInterval(this.standardSyncInterval);
+    if (this.lazySyncInterval) clearInterval(this.lazySyncInterval);
     if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
     if (this.ws) {
       this.ws.close();
@@ -49,6 +61,7 @@ export class CloudSync {
       console.log('[cloud-sync] Connected to cloud');
       this.send({ type: 'hubIdentify', payload: { hubToken: this.hubToken } });
       this.startHeartbeat();
+      this.startTieredSync();
     });
 
     this.ws.on('message', (raw) => {
@@ -63,6 +76,7 @@ export class CloudSync {
     this.ws.on('close', () => {
       console.log('[cloud-sync] Disconnected from cloud');
       this.stopHeartbeat();
+      this.stopTieredSync();
       this.scheduleReconnect();
     });
 
@@ -72,10 +86,12 @@ export class CloudSync {
   }
 
   private handleMessage(data: any) {
+    updateCloudContactTime();
+
     switch (data.type) {
       case 'hubConnected':
         console.log('[cloud-sync] Hub authenticated');
-        this.pullChanges();
+        this.pullChanges(['realtime', 'standard', 'lazy']);
         break;
 
       case 'hubSyncPullResponse':
@@ -92,13 +108,26 @@ export class CloudSync {
       }
 
       case 'forceSyncNow':
-        this.pullChanges();
+        this.pullChanges(['realtime', 'standard', 'lazy']);
         this.pushChanges();
         break;
 
       case 'hubRevoked':
-        console.log('[cloud-sync] Hub token revoked by admin');
+        console.log('[cloud-sync] Hub token revoked by admin — persisting to database');
+        setHubRevoked(true);
+        broadcastToPlayers({ type: 'hubRevoked', payload: {} });
         this.stop();
+        break;
+
+      case 'wipe_content':
+        console.log('[cloud-sync] Received wipe_content — forwarding to all players');
+        broadcastToPlayers({ type: 'wipe_content', payload: data.payload || {} });
+        break;
+
+      case 'subscriptionExpired':
+        console.log('[cloud-sync] Subscription expired — enforcing free screen limit');
+        enforceLocalFreeScreenLimit();
+        broadcastToPlayers({ type: 'subscriptionExpired', payload: {} });
         break;
 
       default:
@@ -119,6 +148,9 @@ export class CloudSync {
           connectionMode: 'LOCAL',
         },
       });
+
+      this.pullChanges(['realtime']);
+      this.pushChanges();
     }, 5 * 60 * 1000);
   }
 
@@ -129,19 +161,49 @@ export class CloudSync {
     }
   }
 
+  private startTieredSync() {
+    this.standardSyncInterval = setInterval(() => {
+      console.log('[cloud-sync] Standard tier sync pull');
+      this.pullChanges(['standard']);
+    }, STANDARD_SYNC_INTERVAL);
+
+    this.lazySyncInterval = setInterval(() => {
+      console.log('[cloud-sync] Lazy tier sync pull');
+      this.pullChanges(['lazy']);
+    }, LAZY_SYNC_INTERVAL);
+  }
+
+  private stopTieredSync() {
+    if (this.standardSyncInterval) {
+      clearInterval(this.standardSyncInterval);
+      this.standardSyncInterval = null;
+    }
+    if (this.lazySyncInterval) {
+      clearInterval(this.lazySyncInterval);
+      this.lazySyncInterval = null;
+    }
+  }
+
   private scheduleReconnect() {
     if (!this.isRunning) return;
     this.reconnectTimeout = setTimeout(() => this.connect(), 10000);
   }
 
-  private pullChanges() {
-    const db = getDb();
-    const syncState = db.prepare('SELECT last_sync_at FROM sync_state WHERE id = 1').get() as any;
-    const since = syncState?.last_sync_at || new Date(0).toISOString();
+  private pullChanges(tiers: string[]) {
+    const syncState = getSyncState();
+
+    let since: string;
+    if (tiers.length === 1 && tiers[0] === 'standard') {
+      since = syncState?.last_standard_sync_at || new Date(0).toISOString();
+    } else if (tiers.length === 1 && tiers[0] === 'lazy') {
+      since = syncState?.last_lazy_sync_at || new Date(0).toISOString();
+    } else {
+      since = syncState?.last_sync_at || new Date(0).toISOString();
+    }
 
     this.send({
       type: 'hubSyncPull',
-      payload: { since },
+      payload: { since, tiers },
     });
   }
 
@@ -176,6 +238,8 @@ export class CloudSync {
     console.log(`[cloud-sync] Applying ${changes.length} changes from cloud`);
 
     let applied = 0;
+    let maxTimestamp = '';
+    const tierMaxTimestamps: Record<string, string> = {};
 
     withoutTriggers(() => {
       for (const change of changes) {
@@ -183,6 +247,8 @@ export class CloudSync {
           const tableName = change.tableName;
           const operation = change.operation;
           const data = change.data || change.payload;
+          const tier = change.syncTier || 'realtime';
+          const changeTs = change.createdAt || change.timestamp || '';
 
           if (!tableName || !operation) continue;
 
@@ -198,14 +264,33 @@ export class CloudSync {
               applied++;
             }
           }
+
+          if (changeTs && changeTs > maxTimestamp) maxTimestamp = changeTs;
+          if (changeTs && (!tierMaxTimestamps[tier] || changeTs > tierMaxTimestamps[tier])) {
+            tierMaxTimestamps[tier] = changeTs;
+          }
         } catch (err: any) {
-          console.error(`[cloud-sync] Failed to apply change:`, err.message);
+          console.error(`[cloud-sync] Failed to apply change to ${change.tableName}:`, err.message);
         }
       }
     });
 
     console.log(`[cloud-sync] Applied ${applied}/${changes.length} changes`);
-    updateSyncState({ last_sync_at: new Date().toISOString() });
+
+    if (applied > 0 && maxTimestamp) {
+      const updates: Record<string, string> = { last_sync_at: maxTimestamp };
+      if (tierMaxTimestamps['standard']) updates.last_standard_sync_at = tierMaxTimestamps['standard'];
+      if (tierMaxTimestamps['lazy']) updates.last_lazy_sync_at = tierMaxTimestamps['lazy'];
+      updateSyncState(updates);
+    }
+
+    const hasScreenLicenseChanges = changes.some(
+      (c) => c.tableName === 'screens' && (c.data?.license_status || c.payload?.license_status)
+    );
+    if (hasScreenLicenseChanges) {
+      console.log('[cloud-sync] Screen license status changed — enforcing free screen limit');
+      enforceLocalFreeScreenLimit();
+    }
   }
 
   private send(message: any) {
