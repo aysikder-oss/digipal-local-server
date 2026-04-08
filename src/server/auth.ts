@@ -99,7 +99,7 @@ export function cleanExpiredSessions(): void {
   db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
 }
 
-const DEFAULT_CLOUD_URL = process.env.CLOUD_URL || 'https://app.digipal.io';
+const DEFAULT_CLOUD_URL = process.env.CLOUD_URL || 'https://digipalsignage.com';
 
 interface CloudTeamMembership {
   team?: { id: number; name: string; description?: string; ownerId?: number };

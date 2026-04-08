@@ -557,7 +557,7 @@ export async function startServer(port: number): Promise<number> {
     const syncState = getSyncState();
     const hubRevoked = isHubRevoked();
     const unpushedCount = getUnpushedChangeCount();
-    const cloudUrl = syncState?.cloud_url || process.env.CLOUD_URL || 'https://app.digipal.io';
+    const cloudUrl = syncState?.cloud_url || process.env.CLOUD_URL || 'https://digipalsignage.com';
     res.json({
       status: hubBlocked ? 'blocked' : hubRevoked ? 'revoked' : 'running',
       hubBlocked,

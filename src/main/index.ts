@@ -9,7 +9,7 @@ let tray: Tray | null = null;
 let isQuitting = false;
 
 let SERVER_PORT = 8787;
-const CLOUD_URL = process.env.CLOUD_URL || 'https://app.digipal.io';
+const CLOUD_URL = process.env.CLOUD_URL || 'https://digipalsignage.com';
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -108,45 +108,45 @@ if (!gotTheLock) {
       mainWindow.focus();
     }
   });
-}
 
-app.whenReady().then(async () => {
-  initDatabase();
+  app.whenReady().then(async () => {
+    initDatabase();
 
-  const canProceed = await performFirstLaunchCheck();
+    const canProceed = await performFirstLaunchCheck();
 
-  if (!canProceed) {
-    const hubs = await scanForExistingHubs(5000);
-    setDiscoveredHubs(hubs);
-    setHubBlocked(true);
-    console.log('[startup] Hub blocked — existing hub found on network. Dashboard will show blocked state.');
-  }
+    if (!canProceed) {
+      const hubs = await scanForExistingHubs(5000);
+      setDiscoveredHubs(hubs);
+      setHubBlocked(true);
+      console.log('[startup] Hub blocked — existing hub found on network. Dashboard will show blocked state.');
+    }
 
-  const actualPort = await startServer(SERVER_PORT);
-  SERVER_PORT = actualPort;
-  createWindow();
-  createTray();
+    const actualPort = await startServer(SERVER_PORT);
+    SERVER_PORT = actualPort;
+    createWindow();
+    createTray();
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    } else {
-      mainWindow?.show();
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+      } else {
+        mainWindow?.show();
+      }
+    });
+  });
+
+  app.on('before-quit', async () => {
+    isQuitting = true;
+    await stopServer();
+  });
+
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') {
+      app.quit();
     }
   });
-});
 
-app.on('before-quit', async () => {
-  isQuitting = true;
-  await stopServer();
-});
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
-});
-
-ipcMain.handle('get-server-port', () => SERVER_PORT);
-ipcMain.handle('get-app-version', () => app.getVersion());
-ipcMain.handle('get-cloud-url', () => CLOUD_URL);
+  ipcMain.handle('get-server-port', () => SERVER_PORT);
+  ipcMain.handle('get-app-version', () => app.getVersion());
+  ipcMain.handle('get-cloud-url', () => CLOUD_URL);
+}
