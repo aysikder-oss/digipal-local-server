@@ -354,8 +354,10 @@ export async function startServer(port: number): Promise<number> {
       if (!origin) return callback(null, true);
       try {
         const url = new URL(origin);
-        if (url.hostname === 'localhost' || url.hostname === '127.0.0.1' ||
-            url.hostname.endsWith('.local') || /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/.test(url.hostname)) {
+        const h = url.hostname;
+        const isLocal = h === 'localhost' || h === '127.0.0.1' || h === '::1';
+        const isPrivateIP = /^(10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)$/.test(h);
+        if (isLocal || isPrivateIP) {
           return callback(null, true);
         }
       } catch (e) { /* invalid origin */ }
@@ -739,7 +741,7 @@ export async function startServer(port: number): Promise<number> {
         const subscriberId = req.session.subscriberId;
         const teamIds = (db.prepare('SELECT team_id FROM team_members WHERE subscriber_id = ?').all(subscriberId) as any[]).map(r => r.team_id);
         const placeholders = teamIds.length > 0 ? teamIds.map(() => '?').join(',') : 'NULL';
-        const schedules = db.prepare(`SELECT s.* FROM schedules s JOIN screens sc ON s.screen_id = sc.id WHERE sc.owner_id = ? OR sc.subscriber_id = ? OR sc.team_id IN (${placeholders}) ORDER BY s.created_at DESC`).all(subscriberId, subscriberId, ...teamIds);
+        const schedules = db.prepare(`SELECT s.* FROM schedules s JOIN screens sc ON s.screen_id = sc.id WHERE sc.owner_id = ? OR sc.team_id IN (${placeholders}) ORDER BY s.created_at DESC`).all(subscriberId, ...teamIds);
         res.json(schedules);
       }
     } catch (e: any) { res.status(500).json({ message: e.message }); }
