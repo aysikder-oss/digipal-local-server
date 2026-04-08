@@ -1039,7 +1039,8 @@ export function initDatabase() {
       subscriber_id INTEGER,
       last_cloud_contact_at TEXT,
       hub_revoked INTEGER DEFAULT 0,
-      hub_name TEXT
+      hub_name TEXT,
+      sync_enabled INTEGER DEFAULT 1
     );
 
     INSERT OR IGNORE INTO sync_state (id) VALUES (1);
@@ -1097,6 +1098,7 @@ function runMigrations(database: Database.Database) {
   addColumnIfMissing('sync_state', 'last_cloud_contact_at', 'TEXT');
   addColumnIfMissing('sync_state', 'hub_revoked', 'INTEGER DEFAULT 0');
   addColumnIfMissing('sync_state', 'hub_name', 'TEXT');
+  addColumnIfMissing('sync_state', 'sync_enabled', 'INTEGER DEFAULT 1');
 }
 
 function setupChangeTriggers(database: Database.Database) {

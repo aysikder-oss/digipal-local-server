@@ -293,6 +293,10 @@ export class CloudSync {
     }
   }
 
+  sendMessage(message: any) {
+    this.send(message);
+  }
+
   private send(message: any) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));

@@ -6,7 +6,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import os from 'os';
-import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount, upsertRow, withoutTriggers } from '../db/sqlite';
+import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount, getUnpushedChanges, getFullRow, markChangesPushed, upsertRow, withoutTriggers } from '../db/sqlite';
 import { startMdns, stopMdns, scanForExistingHubs } from './mdns';
 import { CloudSync } from './cloud-sync';
 import { getConnectedPlayers, registerPlayer, unregisterPlayer, broadcastToPlayers } from './player-bus';
@@ -145,6 +145,47 @@ function startCloudSyncIfNeeded() {
     cloudSync = new CloudSync(syncState.cloud_url, syncState.hub_token);
     cloudSync.start();
   }
+}
+
+async function autoSyncOnStartup() {
+  const db = getDb();
+  const syncState = getSyncState();
+
+  if (syncState?.hub_token && syncState?.last_sync_at) {
+    console.log('[auto-sync] Hub already registered and data synced — skipping startup sync');
+    return;
+  }
+
+  const activeSessions = db.prepare('SELECT * FROM sessions WHERE expires_at > ? ORDER BY expires_at DESC LIMIT 1').all(Date.now()) as any[];
+  if (activeSessions.length === 0) {
+    console.log('[auto-sync] No active sessions found — skipping startup sync');
+    return;
+  }
+
+  const session = activeSessions[0];
+  const subscriber = db.prepare('SELECT * FROM subscribers WHERE id = ?').get(session.subscriber_id) as any;
+  if (!subscriber || !subscriber.password_hash) {
+    console.log('[auto-sync] No subscriber with cached credentials — skipping startup sync');
+    return;
+  }
+
+  const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
+  console.log(`[auto-sync] Found existing session for subscriber ${subscriber.id} — triggering cloud sync`);
+
+  const cloudLoginRes = await fetch(`${cloudUrl}/api/customer/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: subscriber.email, password: '' }),
+  }).catch(() => null);
+
+  if (!cloudLoginRes || !cloudLoginRes.ok) {
+    console.log('[auto-sync] Cannot authenticate with cloud using cached credentials — sync requires fresh login');
+    return;
+  }
+
+  runInitialCloudSync(subscriber.id, cloudUrl, subscriber.email, '').catch(e =>
+    console.error('[auto-sync] Sync error:', e.message)
+  );
 }
 
 async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email: string, password: string) {
@@ -636,6 +677,219 @@ export async function startServer(port: number): Promise<number> {
 
   app.get('/api/instagram/accounts', requireAuth, (_req: Request, res: Response) => {
     res.json([]);
+  });
+
+  app.get('/api/customer/feature-toggles', requireAuth, (_req: Request, res: Response) => {
+    res.json([]);
+  });
+
+  app.get('/api/customer/subscription', requireAuth, (req: Request, res: Response) => {
+    const sub = getSessionSubscriber(req.session.subscriberId);
+    res.json({
+      id: 0,
+      subscriberId: req.session.subscriberId,
+      plan: sub?.plan || 'local',
+      status: 'active',
+      mode: 'local',
+      isLocalServer: true,
+      currentPeriodEnd: null,
+      cancelAtPeriodEnd: false,
+    });
+  });
+
+  app.get('/api/customer/hub', requireAuth, (_req: Request, res: Response) => {
+    const syncState = getSyncState();
+    res.json({
+      id: 0,
+      name: syncState?.hub_name || os.hostname(),
+      hubToken: syncState?.hub_token ? '***' : null,
+      cloudUrl: syncState?.cloud_url || null,
+      isRegistered: !!syncState?.hub_token,
+      isRevoked: isHubRevoked(),
+      lastCloudContact: syncState?.last_cloud_contact_at || null,
+      syncEnabled: syncState?.sync_enabled !== 0,
+    });
+  });
+
+  app.get('/api/customer/login-activity', requireAuth, (_req: Request, res: Response) => {
+    res.json([]);
+  });
+
+  app.get('/api/customer/active-sessions', requireAuth, (req: Request, res: Response) => {
+    res.json([{
+      id: req.session.token,
+      current: true,
+      createdAt: new Date().toISOString(),
+      device: 'Local Server',
+    }]);
+  });
+
+  app.get('/api/customer/trials/status', requireAuth, (_req: Request, res: Response) => {
+    res.json({ active: false, trialEnd: null, plan: null });
+  });
+
+  app.get('/api/customer/custom-plans', requireAuth, (_req: Request, res: Response) => {
+    res.json([]);
+  });
+
+  app.get('/api/plan-configurations', (_req: Request, res: Response) => {
+    res.json([]);
+  });
+
+  app.get('/api/widgets', requireAuth, (_req: Request, res: Response) => {
+    try {
+      const db = getDb();
+      const widgets = db.prepare('SELECT * FROM widget_definitions ORDER BY name').all();
+      res.json(widgets);
+    } catch { res.json([]); }
+  });
+
+  app.get('/api/customer/cloud-sync/status', requireAuth, (_req: Request, res: Response) => {
+    const syncState = getSyncState();
+    const unpushedCount = getUnpushedChangeCount();
+    res.json({
+      syncEnabled: syncState?.sync_enabled !== 0,
+      isConnected: !!(cloudSync && !isHubRevoked()),
+      isRegistered: !!syncState?.hub_token,
+      lastSyncAt: syncState?.last_sync_at || null,
+      lastCloudContact: syncState?.last_cloud_contact_at || null,
+      unpushedChanges: unpushedCount,
+      hubName: syncState?.hub_name || null,
+      hubRevoked: isHubRevoked(),
+      initialSync: initialSyncStatus,
+    });
+  });
+
+  app.post('/api/customer/cloud-sync/toggle', requireAuth, (req: Request, res: Response) => {
+    const { enabled } = req.body;
+    const shouldEnable = enabled !== false;
+
+    updateSyncState({ sync_enabled: shouldEnable ? 1 : 0 });
+
+    if (shouldEnable) {
+      const syncState = getSyncState();
+      if (syncState?.hub_token && syncState?.cloud_url && !isHubRevoked()) {
+        if (!cloudSync) {
+          cloudSync = new CloudSync(syncState.cloud_url, syncState.hub_token);
+        }
+        cloudSync.start();
+        console.log('[cloud-sync] Sync enabled — WebSocket started');
+      }
+    } else {
+      if (cloudSync) {
+        cloudSync.stop();
+        cloudSync = null;
+        console.log('[cloud-sync] Sync disabled — WebSocket stopped');
+      }
+    }
+
+    res.json({ syncEnabled: shouldEnable, message: shouldEnable ? 'Cloud sync enabled' : 'Cloud sync disabled' });
+  });
+
+  app.post('/api/customer/cloud-sync/pull', requireAuth, async (req: Request, res: Response) => {
+    const syncState = getSyncState();
+    const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
+
+    const { email, password } = req.body;
+    let sessionCookie: string | null = null;
+
+    if (email && password) {
+      sessionCookie = await getCloudSession(cloudUrl, email, password);
+    } else {
+      const db = getDb();
+      const sub = db.prepare('SELECT email, password_hash FROM subscribers WHERE id = ?').get(req.session.subscriberId) as any;
+      if (sub?.email) {
+        sessionCookie = await getCloudSession(cloudUrl, sub.email, '').catch(() => null);
+      }
+    }
+
+    if (!sessionCookie) {
+      return res.status(400).json({ message: 'Could not authenticate with cloud. Please provide email and password.' });
+    }
+
+    const endpoints = [
+      { path: '/api/customer/screens', table: 'screens' },
+      { path: '/api/customer/contents', table: 'contents' },
+      { path: '/api/customer/playlists', table: 'playlists' },
+      { path: '/api/customer/folders', table: 'content_folders' },
+      { path: '/api/customer/schedules', table: 'schedules' },
+      { path: '/api/customer/screen-groups', table: 'screen_groups' },
+      { path: '/api/customer/broadcasts', table: 'broadcasts' },
+      { path: '/api/customer/qr-codes', table: 'smart_qr_codes' },
+      { path: '/api/customer/widgets', table: 'widgets' },
+      { path: '/api/customer/video-walls', table: 'video_walls' },
+    ];
+
+    const summary: Record<string, { added: number; updated: number }> = {};
+    let totalSynced = 0;
+
+    for (const ep of endpoints) {
+      try {
+        const fetchRes = await fetch(`${cloudUrl}${ep.path}`, {
+          headers: { 'Cookie': sessionCookie, 'Accept': 'application/json' },
+        });
+        if (!fetchRes.ok) continue;
+        const raw = await fetchRes.json();
+        const data = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' && Array.isArray(raw.data)) ? raw.data : null;
+        if (!data || data.length === 0) continue;
+
+        let added = 0, updated = 0;
+        const db = getDb();
+        withoutTriggers(() => {
+          for (const row of data) {
+            if (!row || typeof row.id === 'undefined') continue;
+            const existing = db.prepare(`SELECT id FROM ${ep.table} WHERE id = ?`).get(row.id);
+            upsertRow(ep.table, row);
+            if (existing) updated++; else added++;
+          }
+        });
+        summary[ep.table] = { added, updated };
+        totalSynced += added + updated;
+      } catch (e: any) {
+        console.log(`[cloud-pull] Skipped ${ep.table}: ${e.message}`);
+      }
+    }
+
+    if (totalSynced > 0) {
+      updateSyncState({ last_sync_at: new Date().toISOString() });
+      broadcastToPlayers({ type: 'contentUpdated', payload: {} });
+    }
+
+    res.json({ message: `Pulled ${totalSynced} records from cloud`, summary, totalSynced });
+  });
+
+  app.post('/api/customer/cloud-sync/push', requireAuth, (_req: Request, res: Response) => {
+    const unpushed = getUnpushedChanges();
+    if (unpushed.length === 0) {
+      return res.json({ message: 'No local changes to push', totalPushed: 0 });
+    }
+
+    if (cloudSync) {
+      const changes = unpushed.map((change: any) => {
+        const row = change.operation !== 'DELETE'
+          ? getFullRow(change.table_name, change.record_id)
+          : null;
+        return {
+          id: change.id,
+          tableName: change.table_name,
+          recordId: change.record_id,
+          operation: change.operation,
+          data: row || JSON.parse(change.payload || '{}'),
+        };
+      });
+
+      cloudSync.sendMessage({
+        type: 'hubSyncPush',
+        payload: { changes },
+      });
+
+      const ids = unpushed.map((c: any) => c.id);
+      markChangesPushed(ids);
+
+      res.json({ message: `Pushed ${changes.length} changes to cloud`, totalPushed: changes.length });
+    } else {
+      res.status(400).json({ message: 'Cloud sync is not connected. Enable sync first.' });
+    }
   });
 
   app.post('/api/customer/logout', (req: Request, res: Response) => {
@@ -2467,12 +2721,16 @@ export async function startServer(port: number): Promise<number> {
 
       startMdns(actualPort, hubName);
 
-      if (syncState?.hub_token && syncState?.cloud_url && !isHubRevoked()) {
+      if (syncState?.hub_token && syncState?.cloud_url && !isHubRevoked() && syncState?.sync_enabled !== 0) {
         cloudSync = new CloudSync(syncState.cloud_url, syncState.hub_token);
         cloudSync.start();
       } else if (isHubRevoked()) {
         console.log('[digipal-local] Hub is revoked — cloud sync disabled');
+      } else if (syncState?.sync_enabled === 0) {
+        console.log('[digipal-local] Cloud sync disabled by user preference');
       }
+
+      autoSyncOnStartup().catch(e => console.error('[auto-sync] Error:', e.message));
 
       resolve(actualPort);
     };
