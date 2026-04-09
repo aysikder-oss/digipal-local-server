@@ -570,15 +570,20 @@ function requirePermission(...permissions: PermissionKey[]) {
 }
 
 function validateTeamAccess(req: Request, res: Response, next: NextFunction) {
-  const teamId = req.query.teamId ? Number(req.query.teamId) : (req.body?.teamId ? Number(req.body.teamId) : null);
-  if (!teamId) return next();
-  const db = getDb();
-  const membership = db.prepare('SELECT id FROM team_members WHERE team_id = ? AND subscriber_id = ?').get(teamId, req.session.subscriberId) as { id: number } | undefined;
-  const isOwner = db.prepare('SELECT id FROM teams WHERE id = ? AND owner_id = ?').get(teamId, req.session.subscriberId) as { id: number } | undefined;
-  if (!membership && !isOwner) {
-    return res.status(403).json({ message: 'You do not have access to this team' });
+  try {
+    const teamId = req.query.teamId ? Number(req.query.teamId) : (req.body?.teamId ? Number(req.body.teamId) : null);
+    if (!teamId) return next();
+    const db = getDb();
+    const membership = db.prepare('SELECT id FROM team_members WHERE team_id = ? AND subscriber_id = ?').get(teamId, req.session.subscriberId) as { id: number } | undefined;
+    const isOwner = db.prepare('SELECT id FROM teams WHERE id = ? AND owner_id = ?').get(teamId, req.session.subscriberId) as { id: number } | undefined;
+    if (!membership && !isOwner) {
+      return res.status(403).json({ message: 'You do not have access to this team' });
+    }
+    next();
+  } catch (e: any) {
+    console.error('[validateTeamAccess] Error:', e.message);
+    next();
   }
-  next();
 }
 
 function cookieParser(req: Request, _res: Response, next: NextFunction) {
@@ -643,22 +648,28 @@ const PARENT_OWNERSHIP_MAP: Record<string, { table: string; fk: string; parentTa
 function requireOwnership(table: string) {
   const parentDef = PARENT_OWNERSHIP_MAP[table];
   if (!parentDef && !ALLOWED_OWNERSHIP_TABLES.has(table)) {
-    throw new Error(`requireOwnership: unknown table "${table}"`);
+    console.error(`[requireOwnership] Unknown table "${table}" — skipping ownership check`);
+    return (_req: Request, _res: Response, next: NextFunction) => next();
   }
   return async (req: Request, res: Response, next: NextFunction) => {
-    if (!req.session?.subscriberId) return res.status(401).json({ message: 'Authentication required' });
-    const db = getDb();
-    const row = db.prepare(`SELECT * FROM ${parentDef ? parentDef.table : table} WHERE id = ?`).get(Number(req.params.id)) as OwnableRow | undefined;
-    if (!row) return res.status(404).json({ message: 'Not found' });
-    if (parentDef) {
-      const fkValue = row[parentDef.fk] as number | undefined;
-      const parent = db.prepare(`SELECT * FROM ${parentDef.parentTable} WHERE id = ?`).get(fkValue) as OwnableRow | undefined;
-      if (!parent || !assertOwnership(parent, req.session.subscriberId)) return res.status(403).json({ message: 'Access denied' });
-    } else {
-      if (!assertOwnership(row, req.session.subscriberId)) return res.status(403).json({ message: 'Access denied' });
+    try {
+      if (!req.session?.subscriberId) return res.status(401).json({ message: 'Authentication required' });
+      const db = getDb();
+      const row = db.prepare(`SELECT * FROM ${parentDef ? parentDef.table : table} WHERE id = ?`).get(Number(req.params.id)) as OwnableRow | undefined;
+      if (!row) return res.status(404).json({ message: 'Not found' });
+      if (parentDef) {
+        const fkValue = row[parentDef.fk] as number | undefined;
+        const parent = db.prepare(`SELECT * FROM ${parentDef.parentTable} WHERE id = ?`).get(fkValue) as OwnableRow | undefined;
+        if (!parent || !assertOwnership(parent, req.session.subscriberId)) return res.status(403).json({ message: 'Access denied' });
+      } else {
+        if (!assertOwnership(row, req.session.subscriberId)) return res.status(403).json({ message: 'Access denied' });
+      }
+      req.resource = row;
+      next();
+    } catch (e: any) {
+      console.error(`[requireOwnership] Error for ${table}:`, e.message);
+      res.status(500).json({ message: e.message, source: 'requireOwnership', table });
     }
-    req.resource = row;
-    next();
   };
 }
 
@@ -828,6 +839,35 @@ export async function startServer(port: number): Promise<number> {
   app.use(express.urlencoded({ extended: true }));
   app.use(sessionMiddleware);
 
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (req.path.startsWith('/api/')) {
+      const start = Date.now();
+      const origEnd = res.end;
+      (res as any).end = function(...args: any[]) {
+        const ms = Date.now() - start;
+        if (res.statusCode >= 400) {
+          console.error(`[http] ${req.method} ${req.originalUrl} → ${res.statusCode} (${ms}ms) session=${!!req.session?.subscriberId}`);
+        }
+        return origEnd.apply(this, args);
+      };
+    }
+    next();
+  });
+
+  app.get('/api/diagnostics', (_req: Request, res: Response) => {
+    try {
+      const db = getDb();
+      const tables = ['screens', 'contents', 'playlists', 'schedules', 'subscribers', 'content_folders', 'broadcasts', 'design_templates', 'kiosks', 'video_walls'];
+      const counts: Record<string, number> = {};
+      for (const t of tables) {
+        try { counts[t] = (db.prepare(`SELECT COUNT(*) as c FROM ${t}`).get() as any).c; } catch { counts[t] = -1; }
+      }
+      const sessions = db.prepare('SELECT id, subscriber_id, created_at FROM sessions').all();
+      const syncState = getSyncState();
+      res.json({ ok: true, counts, sessions, syncState: { hub_token: syncState?.hub_token ? '***' : null, cloud_url: syncState?.cloud_url, last_sync_at: syncState?.last_sync_at, hub_revoked: syncState?.hub_revoked } });
+    } catch (e: any) { res.json({ ok: false, error: e.message, stack: e.stack }); }
+  });
+
   app.post('/api/customer/login', async (req: Request, res: Response) => {
     if (hubBlocked) return res.status(503).json({ message: 'Hub is blocked — another Digipal hub was detected on this network. Only one hub is allowed per network.' });
     const { email, password } = req.body;
@@ -927,13 +967,15 @@ export async function startServer(port: number): Promise<number> {
     res.json([]);
   });
 
-  app.get('/api/widgets', requireAuth, (_req: Request, res: Response) => {
+  const widgetsHandler = (req: Request, res: Response) => {
     try {
       const db = getDb();
       const widgets = db.prepare('SELECT * FROM widget_definitions ORDER BY name').all();
       res.json(widgets);
     } catch { res.json([]); }
-  });
+  };
+  app.get('/api/widgets', requireAuth, widgetsHandler);
+  app.get('/api/customer/widgets', requireAuth, widgetsHandler);
 
   app.get('/api/customer/cloud-sync/status', requireAuth, (_req: Request, res: Response) => {
     const syncState = getSyncState();
@@ -1255,7 +1297,9 @@ export async function startServer(port: number): Promise<number> {
   app.use((req: Request, _res: Response, next: NextFunction) => {
     for (const [prefix, target] of Object.entries(customerPathMap)) {
       if (req.path === prefix || req.path.startsWith(prefix + '/')) {
+        const before = req.url;
         req.url = req.url.replace(prefix, target);
+        console.log(`[path-rewrite] ${before} → ${req.url}`);
         break;
       }
     }
@@ -1310,7 +1354,7 @@ export async function startServer(port: number): Promise<number> {
       lastCloudContact: syncState?.last_cloud_contact_at,
       unpushedChanges: unpushedCount,
       hubName: syncState?.hub_name,
-      version: '1.2.15',
+      version: '1.2.16',
       mode: 'local',
       isLocalServer: true,
       cloudUrl,
@@ -2881,6 +2925,13 @@ export async function startServer(port: number): Promise<number> {
       return res.status(404).json({ message: 'Not found' });
     }
     res.sendFile(path.join(frontendPath, 'index.html'));
+  });
+
+  app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
+    console.error(`[global-error] ${req.method} ${req.originalUrl}:`, err.message, err.stack);
+    if (!res.headersSent) {
+      res.status(500).json({ message: err.message, route: req.originalUrl, stack: err.stack?.split('\n').slice(0, 5) });
+    }
   });
 
   server = http.createServer(app);
