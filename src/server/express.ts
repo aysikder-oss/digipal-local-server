@@ -1329,51 +1329,13 @@ export async function startServer(port: number): Promise<number> {
     const currentSyncState = getSyncState();
     const hubRegistered = !!currentSyncState?.hub_token && !currentSyncState?.hub_revoked;
 
-    if (role === 'owner' && !hubRegistered && !initialSyncStatus.inProgress && !hubReattemptInProgress) {
-      const timeSinceLastAttempt = Date.now() - lastHubReattemptAt;
-      if (timeSinceLastAttempt > HUB_REATTEMPT_COOLDOWN) {
-        hubReattemptInProgress = true;
-        lastHubReattemptAt = Date.now();
-        const cloudUrl = currentSyncState?.cloud_url || 'https://digipalsignage.com';
-        const cloudCookie = currentSyncState?.cloud_session_cookie;
-        if (cloudCookie) {
-          console.log('[me] Owner session detected without hub registration — attempting session-based registration');
-          (async () => {
-            try {
-              const hubName = `${os.hostname()} Local Server`;
-              const regRes = await fetch(`${cloudUrl}/api/hub/register-session`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Cookie': cloudCookie },
-                body: JSON.stringify({ name: hubName }),
-              });
-              if (regRes.ok) {
-                const result = await regRes.json() as any;
-                if (result.hubToken) {
-                  updateSyncState({ hub_token: result.hubToken, cloud_url: cloudUrl, subscriber_id: sub.id, hub_name: hubName, hub_revoked: 0 });
-                  console.log(`[me] Hub registered via cached session — hubId: ${result.hubId}`);
-                  startCloudSyncIfNeeded();
-                  initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
-                }
-              }
-            } catch (e: any) {
-              console.log(`[me] Hub reattempt failed: ${e.message}`);
-            } finally {
-              hubReattemptInProgress = false;
-            }
-          })();
-        } else {
-          hubReattemptInProgress = false;
-        }
-      }
-    }
-
     res.json({
       ...sub,
       accountRole: role,
       consentTosAt: (sub as any).consentTosAt || now,
       consentPrivacyAt: (sub as any).consentPrivacyAt || now,
       hubRegistered,
-      syncStatus: hubRegistered ? 'complete' : (initialSyncStatus.inProgress || hubReattemptInProgress ? 'pending' : 'not_started'),
+      syncStatus: hubRegistered ? 'complete' : (initialSyncStatus.inProgress ? 'pending' : 'not_started'),
       workspace: {
         teamId: null,
         teamName: null,
