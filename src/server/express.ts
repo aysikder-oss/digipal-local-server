@@ -156,13 +156,63 @@ async function autoSyncOnStartup() {
     return;
   }
 
-  if (!syncState.hub_token || !syncState.cloud_url) {
+  if (!syncState.hub_token) {
+    const cloudUrl = syncState.cloud_url || 'https://digipalsignage.com';
     const activeSessions = db.prepare('SELECT * FROM sessions WHERE expires_at > ? ORDER BY expires_at DESC LIMIT 1').all(Date.now()) as any[];
+
     if (activeSessions.length > 0) {
-      console.log('[auto-sync] Active session exists but no hub token — user needs to re-login to register hub');
-    } else {
-      console.log('[auto-sync] No hub token and no active sessions — needs fresh login');
+      console.log('[auto-sync] Active session exists but no hub token — attempting automatic hub registration...');
+
+      const subscriber = db.prepare('SELECT * FROM subscribers WHERE id = (SELECT subscriber_id FROM sessions WHERE id = ?)').get((activeSessions[0] as any).id) as any;
+      if (subscriber) {
+        const hubName = `${require('os').hostname()} Local Server`;
+        let registered = false;
+
+        if (syncState.cloud_session_cookie) {
+          console.log('[auto-sync] Trying session-based hub registration...');
+          try {
+            const res = await fetch(`${cloudUrl}/api/hub/register-session`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Cookie': syncState.cloud_session_cookie },
+              body: JSON.stringify({ name: hubName }),
+            });
+            if (res.ok) {
+              const result = await res.json() as any;
+              if (result.hubToken) {
+                updateSyncState({ hub_token: result.hubToken, cloud_url: cloudUrl, subscriber_id: subscriber.id, hub_name: hubName, hub_revoked: 0 });
+                console.log(`[auto-sync] Hub registered via session — hubId: ${result.hubId}`);
+                registered = true;
+              }
+            } else {
+              console.log(`[auto-sync] Session-based registration failed: HTTP ${res.status}`);
+            }
+          } catch (e: any) {
+            console.log(`[auto-sync] Session-based registration error: ${e.message}`);
+          }
+        }
+
+        if (!registered) {
+          console.log('[auto-sync] Could not auto-register hub — user should re-login');
+          return;
+        }
+
+        const updatedState = getSyncState();
+        if (updatedState?.hub_token && updatedState?.cloud_url) {
+          startCloudSyncIfNeeded();
+          console.log('[auto-sync] CloudSync started after auto-registration');
+
+          try {
+            const totalSynced = await pullFullDataViaHubToken(updatedState.cloud_url, updatedState.hub_token);
+            console.log(`[auto-sync] Full pull complete after auto-registration — ${totalSynced} rows synced`);
+          } catch (e: any) {
+            console.error('[auto-sync] Full pull after auto-registration failed:', e.message);
+          }
+        }
+        return;
+      }
     }
+
+    console.log('[auto-sync] No hub token and no active sessions — needs fresh login');
     return;
   }
 
@@ -321,7 +371,8 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
     return;
   }
 
-  console.log('[initial-sync] Cloud session obtained, starting full data pull...');
+  updateSyncState({ cloud_session_cookie: sessionCookie });
+  console.log('[initial-sync] Cloud session obtained and saved, starting full data pull...');
 
   const totalSynced = await pullAllDataFromCloud(cloudUrl, sessionCookie, (step) => {
     initialSyncStatus.step = step;

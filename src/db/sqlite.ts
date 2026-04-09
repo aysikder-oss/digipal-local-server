@@ -1099,6 +1099,7 @@ function runMigrations(database: Database.Database) {
   addColumnIfMissing('sync_state', 'hub_revoked', 'INTEGER DEFAULT 0');
   addColumnIfMissing('sync_state', 'hub_name', 'TEXT');
   addColumnIfMissing('sync_state', 'sync_enabled', 'INTEGER DEFAULT 1');
+  addColumnIfMissing('sync_state', 'cloud_session_cookie', 'TEXT');
 }
 
 function setupChangeTriggers(database: Database.Database) {
