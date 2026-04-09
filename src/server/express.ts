@@ -162,6 +162,7 @@ async function autoSyncOnStartup() {
 
     if (activeSessions.length > 0) {
       console.log('[auto-sync] Active session exists but no hub token — attempting automatic hub registration...');
+      initialSyncStatus = { inProgress: true, step: 'Registering with cloud...', error: null, completedAt: null };
 
       const subscriber = db.prepare('SELECT * FROM subscribers WHERE id = (SELECT subscriber_id FROM sessions WHERE id = ?)').get((activeSessions[0] as any).id) as any;
       if (subscriber) {
@@ -170,6 +171,7 @@ async function autoSyncOnStartup() {
 
         if (syncState.cloud_session_cookie) {
           console.log('[auto-sync] Trying session-based hub registration...');
+          initialSyncStatus.step = 'Authenticating with cloud...';
           try {
             const res = await fetch(`${cloudUrl}/api/hub/register-session`, {
               method: 'POST',
@@ -193,6 +195,7 @@ async function autoSyncOnStartup() {
 
         if (!registered) {
           console.log('[auto-sync] Could not auto-register hub — user should re-login');
+          initialSyncStatus = { inProgress: false, step: '', error: 'Please log out and log back in to sync with cloud', completedAt: null };
           return;
         }
 
@@ -200,12 +203,15 @@ async function autoSyncOnStartup() {
         if (updatedState?.hub_token && updatedState?.cloud_url) {
           startCloudSyncIfNeeded();
           console.log('[auto-sync] CloudSync started after auto-registration');
+          initialSyncStatus.step = 'Pulling data from cloud...';
 
           try {
             const totalSynced = await pullFullDataViaHubToken(updatedState.cloud_url, updatedState.hub_token);
             console.log(`[auto-sync] Full pull complete after auto-registration — ${totalSynced} rows synced`);
+            initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
           } catch (e: any) {
             console.error('[auto-sync] Full pull after auto-registration failed:', e.message);
+            initialSyncStatus = { inProgress: false, step: '', error: 'Failed to pull data from cloud', completedAt: null };
           }
         }
         return;
@@ -233,11 +239,14 @@ async function autoSyncOnStartup() {
   const screenCount = (db.prepare('SELECT COUNT(*) as c FROM screens').get() as any)?.c || 0;
   if ((contentCount === 0 && screenCount === 0) || !syncState.last_sync_at) {
     console.log('[auto-sync] No local data or never synced — attempting full data pull...');
+    initialSyncStatus = { inProgress: true, step: 'Pulling data from cloud...', error: null, completedAt: null };
     try {
       const totalSynced = await pullFullDataViaHubToken(syncState.cloud_url, syncState.hub_token);
       console.log(`[auto-sync] Full pull complete — ${totalSynced} rows synced`);
+      initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
     } catch (e: any) {
       console.error('[auto-sync] Full pull failed:', e.message);
+      initialSyncStatus = { inProgress: false, step: '', error: 'Failed to pull data from cloud', completedAt: null };
     }
   }
 }
