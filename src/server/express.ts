@@ -27,10 +27,7 @@ let initialSyncStatus: { inProgress: boolean; step: string; error: string | null
   inProgress: false, step: '', error: null, completedAt: null,
 };
 
-let hubReattemptInProgress = false;
-let lastHubReattemptAt = 0;
 let hubRegistrationInProgress = false;
-const HUB_REATTEMPT_COOLDOWN = 60000;
 
 async function getCloudSession(cloudUrl: string, email: string, password: string): Promise<string | null> {
   try {
@@ -180,45 +177,12 @@ function startCloudSyncIfNeeded() {
   if (cloudSync) return;
   const syncState = getSyncState();
   if (syncState?.hub_token && syncState?.cloud_url && !isHubRevoked()) {
-    console.log('[initial-sync] Starting CloudSync WebSocket...');
+    console.log('[cloud-sync] Starting CloudSync WebSocket...');
     cloudSync = new CloudSync(syncState.cloud_url, syncState.hub_token, () => {
-      console.log('[cloud-sync] Auth failure callback — clearing stale hub token for re-registration on next login');
+      console.log('[cloud-sync] Auth failure — hub token rejected by cloud, clearing for re-registration on next login');
       cloudSync = null;
-      updateSyncState({ hub_token: null, hub_name: null, hub_revoked: 0 });
+      updateSyncState({ hub_token: null, hub_name: null });
       initialSyncStatus = { inProgress: false, step: '', error: 'Hub token rejected — please log out and log back in to re-register', completedAt: null };
-
-      if (hubRegistrationInProgress) {
-        console.log('[cloud-sync] Registration already in progress — skipping re-registration');
-        return;
-      }
-
-      const currentState = getSyncState();
-      if (currentState?.cloud_session_cookie && currentState?.subscriber_id && currentState?.cloud_url) {
-        hubRegistrationInProgress = true;
-        console.log('[cloud-sync] Attempting automatic re-registration via saved session cookie...');
-        const hubName = `${os.hostname()} Local Server`;
-        fetch(`${currentState.cloud_url}/api/hub/register-session`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Cookie': currentState.cloud_session_cookie },
-          body: JSON.stringify({ name: hubName }),
-        }).then(async (res) => {
-          if (res.ok) {
-            const result = await res.json() as any;
-            if (result.hubToken) {
-              updateSyncState({ hub_token: result.hubToken, hub_name: hubName, hub_revoked: 0 });
-              console.log(`[cloud-sync] Auto re-registered hub — hubId: ${result.hubId}`);
-              initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
-              startCloudSyncIfNeeded();
-            }
-          } else {
-            console.log(`[cloud-sync] Session-based re-registration failed: HTTP ${res.status}`);
-          }
-        }).catch((e: any) => {
-          console.log(`[cloud-sync] Session-based re-registration error: ${e.message}`);
-        }).finally(() => {
-          hubRegistrationInProgress = false;
-        });
-      }
     });
     cloudSync.start();
   }
@@ -234,68 +198,8 @@ async function autoSyncOnStartup() {
   }
 
   if (!syncState.hub_token) {
-    const cloudUrl = syncState.cloud_url || 'https://digipalsignage.com';
-    const activeSessions = db.prepare('SELECT * FROM sessions WHERE expires_at > ? ORDER BY expires_at DESC LIMIT 1').all(Date.now()) as any[];
-
-    if (activeSessions.length > 0) {
-      console.log('[auto-sync] Active session exists but no hub token — attempting automatic hub registration...');
-      initialSyncStatus = { inProgress: true, step: 'Registering with cloud...', error: null, completedAt: null };
-
-      const subscriber = db.prepare('SELECT * FROM subscribers WHERE id = (SELECT subscriber_id FROM sessions WHERE id = ?)').get((activeSessions[0] as any).id) as any;
-      if (subscriber) {
-        const hubName = `${require('os').hostname()} Local Server`;
-        let registered = false;
-
-        if (syncState.cloud_session_cookie) {
-          console.log('[auto-sync] Trying session-based hub registration...');
-          initialSyncStatus.step = 'Authenticating with cloud...';
-          try {
-            const res = await fetch(`${cloudUrl}/api/hub/register-session`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Cookie': syncState.cloud_session_cookie },
-              body: JSON.stringify({ name: hubName }),
-            });
-            if (res.ok) {
-              const result = await res.json() as any;
-              if (result.hubToken) {
-                updateSyncState({ hub_token: result.hubToken, cloud_url: cloudUrl, subscriber_id: subscriber.id, hub_name: hubName, hub_revoked: 0 });
-                console.log(`[auto-sync] Hub registered via session — hubId: ${result.hubId}`);
-                registered = true;
-              }
-            } else {
-              console.log(`[auto-sync] Session-based registration failed: HTTP ${res.status}`);
-            }
-          } catch (e: any) {
-            console.log(`[auto-sync] Session-based registration error: ${e.message}`);
-          }
-        }
-
-        if (!registered) {
-          console.log('[auto-sync] Could not auto-register hub — user should re-login');
-          initialSyncStatus = { inProgress: false, step: '', error: 'Please log out and log back in to sync with cloud', completedAt: null };
-          return;
-        }
-
-        const updatedState = getSyncState();
-        if (updatedState?.hub_token && updatedState?.cloud_url) {
-          startCloudSyncIfNeeded();
-          console.log('[auto-sync] CloudSync started after auto-registration');
-          initialSyncStatus.step = 'Pulling data from cloud...';
-
-          try {
-            const totalSynced = await pullFullDataViaHubToken(updatedState.cloud_url, updatedState.hub_token);
-            console.log(`[auto-sync] Full pull complete after auto-registration — ${totalSynced} rows synced`);
-            initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
-          } catch (e: any) {
-            console.error('[auto-sync] Full pull after auto-registration failed:', e.message);
-            initialSyncStatus = { inProgress: false, step: '', error: 'Failed to pull data from cloud', completedAt: null };
-          }
-        }
-        return;
-      }
-    }
-
-    console.log('[auto-sync] No hub token and no active sessions — needs fresh login');
+    console.log('[auto-sync] No hub token — user must log in to register with cloud');
+    initialSyncStatus = { inProgress: false, step: '', error: null, completedAt: null };
     return;
   }
 
@@ -1098,10 +1002,11 @@ export async function startServer(port: number): Promise<number> {
         syncError: syncSucceeded ? null : (initialSyncStatus.error || 'Hub registration still in progress'),
       });
     } else {
-      if (isOwner) {
-        runInitialCloudSync(subscriber.id as number, cloudUrl, email, password, capturedCookie).catch(e =>
-          console.error('[initial-sync] Error:', e.message)
-        );
+      if (isOwner && capturedCookie) {
+        updateSyncState({ cloud_session_cookie: capturedCookie });
+      }
+      if (isOwner && hubAlreadyRegistered && !cloudSync) {
+        startCloudSyncIfNeeded();
       }
       res.json({
         ...subscriber,
@@ -1161,16 +1066,22 @@ export async function startServer(port: number): Promise<number> {
 
   app.get('/api/customer/hub', requireAuth, (_req: Request, res: Response) => {
     const syncState = getSyncState();
-    res.json({
+    if (!syncState?.hub_token) {
+      res.json([]);
+      return;
+    }
+    res.json([{
       id: 0,
-      name: syncState?.hub_name || os.hostname(),
-      hubToken: syncState?.hub_token ? '***' : null,
-      cloudUrl: syncState?.cloud_url || null,
-      isRegistered: !!syncState?.hub_token,
-      isRevoked: isHubRevoked(),
-      lastCloudContact: syncState?.last_cloud_contact_at || null,
-      syncEnabled: syncState?.sync_enabled !== 0,
-    });
+      subscriberId: syncState.subscriber_id || 0,
+      name: syncState.hub_name || os.hostname(),
+      hubToken: '***',
+      isOnline: !!(cloudSync?.isConnected()),
+      lastSeenAt: syncState.last_cloud_contact_at || null,
+      lastSyncAt: syncState.last_sync_at || null,
+      connectedScreenCount: 0,
+      version: require('../../package.json').version,
+      createdAt: null,
+    }]);
   });
 
   app.get('/api/customer/login-activity', requireAuth, (_req: Request, res: Response) => {
@@ -1639,10 +1550,11 @@ export async function startServer(port: number): Promise<number> {
         token: sessionId,
       });
     } else {
-      if (isOwner) {
-        runInitialCloudSync(subscriber.id, cloudUrl, email, password, capturedCookie).catch(e =>
-          console.error('[auth/login] Cloud sync error:', e.message)
-        );
+      if (isOwner && capturedCookie) {
+        updateSyncState({ cloud_session_cookie: capturedCookie });
+      }
+      if (isOwner && hubAlreadyRegistered && !cloudSync) {
+        startCloudSyncIfNeeded();
       }
       res.json({ subscriber: { ...subscriber, syncStatus: 'complete' }, token: sessionId });
     }
