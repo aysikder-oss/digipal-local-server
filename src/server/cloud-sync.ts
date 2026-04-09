@@ -373,6 +373,12 @@ export class CloudSync {
     return !!(this.ws && this.ws.readyState === WebSocket.OPEN && this.isAuthenticated);
   }
 
+  triggerForceSync() {
+    if (!this.isConnected()) return;
+    this.pullChanges(['realtime', 'standard', 'lazy']);
+    this.pushChanges();
+  }
+
   sendMessage(message: any): boolean {
     if (!this.isConnected()) return false;
     this.send(message);
