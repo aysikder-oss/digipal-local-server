@@ -367,7 +367,7 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
   if (hubResult) {
     startCloudSyncIfNeeded();
   } else {
-    console.log('[initial-sync] Hub registration via password failed — will try session-based registration');
+    console.log('[initial-sync] Hub registration failed — will proceed with data pull via REST if session available');
   }
 
   initialSyncStatus.step = 'Authenticating with cloud...';
@@ -1039,7 +1039,7 @@ export async function startServer(port: number): Promise<number> {
 
   app.post('/api/customer/hub/sync', requireAuth, async (req: Request, res: Response) => {
     const sub = getSessionSubscriber(req.session.subscriberId);
-    if (!sub || (sub as any).account_role !== 'owner') {
+    if (!sub || sub.accountRole !== 'owner') {
       return res.status(403).json({ message: 'Only the account owner can trigger hub sync' });
     }
     if (cloudSync?.isConnected()) {
@@ -1052,7 +1052,7 @@ export async function startServer(port: number): Promise<number> {
 
   app.post('/api/customer/hub/token/regenerate', requireAuth, async (req: Request, res: Response) => {
     const sub = getSessionSubscriber(req.session.subscriberId);
-    if (!sub || (sub as any).account_role !== 'owner') {
+    if (!sub || sub.accountRole !== 'owner') {
       return res.status(403).json({ message: 'Only the account owner can regenerate the hub token' });
     }
     const syncState = getSyncState();
