@@ -8,3 +8,4 @@ release/
 *.AppImage
 *.snap
 .DS_Store
+dist/public/
