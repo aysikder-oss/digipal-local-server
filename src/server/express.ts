@@ -842,13 +842,13 @@ export async function startServer(port: number): Promise<number> {
   app.use((req: Request, res: Response, next: NextFunction) => {
     if (req.path.startsWith('/api/')) {
       const start = Date.now();
-      const origEnd = res.end;
-      (res as any).end = function(...args: any[]) {
+      const origJson = res.json.bind(res);
+      res.json = function(body: any) {
         const ms = Date.now() - start;
         if (res.statusCode >= 400) {
-          console.error(`[http] ${req.method} ${req.originalUrl} → ${res.statusCode} (${ms}ms) session=${!!req.session?.subscriberId}`);
+          console.error(`[http] ${req.method} ${req.originalUrl} → ${res.statusCode} (${ms}ms) session=${!!req.session?.subscriberId} body=${JSON.stringify(body)?.slice(0, 500)}`);
         }
-        return origEnd.apply(this, args);
+        return origJson(body);
       };
     }
     next();
