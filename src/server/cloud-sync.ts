@@ -31,12 +31,16 @@ export class CloudSync {
   private lazySyncInterval: NodeJS.Timeout | null = null;
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private errorReportInterval: NodeJS.Timeout | null = null;
+  private authTimeout: NodeJS.Timeout | null = null;
   private isRunning = false;
+  private isAuthenticated = false;
   private pushAckPending = new Set<number>();
+  private onAuthFailure?: () => void;
 
-  constructor(cloudUrl: string, hubToken: string) {
+  constructor(cloudUrl: string, hubToken: string, onAuthFailure?: () => void) {
     this.cloudUrl = cloudUrl;
     this.hubToken = hubToken;
+    this.onAuthFailure = onAuthFailure;
   }
 
   start() {
@@ -53,11 +57,13 @@ export class CloudSync {
 
   stop() {
     this.isRunning = false;
+    this.isAuthenticated = false;
     if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
     if (this.standardSyncInterval) clearInterval(this.standardSyncInterval);
     if (this.lazySyncInterval) clearInterval(this.lazySyncInterval);
     if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
     if (this.errorReportInterval) clearInterval(this.errorReportInterval);
+    if (this.authTimeout) clearTimeout(this.authTimeout);
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -67,14 +73,26 @@ export class CloudSync {
   private connect() {
     if (!this.isRunning) return;
 
+    this.isAuthenticated = false;
     const wsUrl = this.cloudUrl.replace(/^http/, 'ws');
     this.ws = new WebSocket(wsUrl);
 
     this.ws.on('open', () => {
       console.log('[cloud-sync] Connected to cloud');
       this.send({ type: 'hubIdentify', payload: { hubToken: this.hubToken } });
-      this.startHeartbeat();
-      this.startTieredSync();
+
+      if (this.authTimeout) clearTimeout(this.authTimeout);
+      this.authTimeout = setTimeout(() => {
+        if (!this.isAuthenticated && this.isRunning) {
+          console.error('[cloud-sync] Auth timeout — no hubConnected received within 15s, treating as auth failure');
+          insertErrorLog({
+            level: 'error',
+            source: 'cloud-sync',
+            message: 'Hub authentication timed out — hub token may be invalid',
+          });
+          this.handleAuthFailure();
+        }
+      }, 15000);
     });
 
     this.ws.on('message', (raw) => {
@@ -103,14 +121,43 @@ export class CloudSync {
     });
   }
 
+  private handleAuthFailure() {
+    console.log('[cloud-sync] Triggering auth failure handler — stopping sync');
+    this.stop();
+    if (this.onAuthFailure) {
+      this.onAuthFailure();
+    }
+  }
+
   private handleMessage(data: any) {
     updateCloudContactTime();
 
     switch (data.type) {
       case 'hubConnected':
         console.log('[cloud-sync] Hub authenticated');
+        this.isAuthenticated = true;
+        if (this.authTimeout) {
+          clearTimeout(this.authTimeout);
+          this.authTimeout = null;
+        }
+        this.startHeartbeat();
+        this.startTieredSync();
         this.pullChanges(['realtime', 'standard', 'lazy']);
         break;
+
+      case 'error': {
+        const msg = data.payload?.message || 'Unknown error';
+        console.error(`[cloud-sync] Server error: ${msg}`);
+        insertErrorLog({
+          level: 'error',
+          source: 'cloud-sync',
+          message: `Cloud WebSocket error: ${msg}`,
+        });
+        if (msg.toLowerCase().includes('invalid hub token') || msg.toLowerCase().includes('unauthorized')) {
+          this.handleAuthFailure();
+        }
+        break;
+      }
 
       case 'hubSyncPullResponse':
         this.applyChanges(data.payload?.changes || []);
@@ -319,7 +366,7 @@ export class CloudSync {
   }
 
   isConnected(): boolean {
-    return !!(this.ws && this.ws.readyState === WebSocket.OPEN);
+    return !!(this.ws && this.ws.readyState === WebSocket.OPEN && this.isAuthenticated);
   }
 
   sendMessage(message: any): boolean {

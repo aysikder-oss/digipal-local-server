@@ -16,6 +16,7 @@ export interface AuthResult {
   success: boolean;
   subscriber?: Subscriber;
   error?: string;
+  cloudSessionCookie?: string;
 }
 
 interface SessionRow {
@@ -195,10 +196,34 @@ export async function authenticateUser(email: string, password: string): Promise
 
           hydrateTeamMemberships(raw.id as number, cloudUrl);
 
+          let cloudSessionCookie: string | undefined;
+          try {
+            const cookies: string[] = [];
+            const getter = (res.headers as any).getSetCookie;
+            if (typeof getter === 'function') {
+              for (const c of getter.call(res.headers) as string[]) {
+                const nameVal = c.split(';')[0];
+                if (nameVal) cookies.push(nameVal);
+              }
+            }
+            if (cookies.length === 0) {
+              const rawCookie = res.headers.get('set-cookie');
+              if (rawCookie) {
+                for (const part of rawCookie.split(/,(?=\s*\w+=)/)) {
+                  const nameVal = part.trim().split(';')[0];
+                  if (nameVal) cookies.push(nameVal);
+                }
+              }
+            }
+            if (cookies.length > 0) {
+              cloudSessionCookie = cookies.join('; ');
+            }
+          } catch (_e) {}
+
           const subscriber: Subscriber = {
             id: raw.id, name, email, company, status, plan, accountRole,
           };
-          return { success: true, subscriber };
+          return { success: true, subscriber, cloudSessionCookie };
         }
       } else {
         const errData = await res.json().catch(() => ({ message: '' })) as { message?: string };
