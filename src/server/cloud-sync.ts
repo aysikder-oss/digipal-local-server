@@ -122,6 +122,16 @@ export class CloudSync {
       if (!didOpen) {
         this.consecutiveFailures++;
         console.log(`[cloud-sync] Connection failed without opening (attempt ${this.consecutiveFailures})`);
+        if (this.consecutiveFailures >= 5) {
+          console.error('[cloud-sync] 5 consecutive connection failures — treating as auth failure');
+          insertErrorLog({
+            level: 'error',
+            source: 'cloud-sync',
+            message: `WebSocket failed to connect ${this.consecutiveFailures} times consecutively`,
+          });
+          this.handleAuthFailure();
+          return;
+        }
       }
 
       this.scheduleReconnect();
@@ -268,8 +278,9 @@ export class CloudSync {
 
   private scheduleReconnect() {
     if (!this.isRunning) return;
+    const exponent = Math.max(0, this.consecutiveFailures - 1);
     const delay = Math.min(
-      CloudSync.BASE_RECONNECT_MS * Math.pow(2, this.consecutiveFailures),
+      CloudSync.BASE_RECONNECT_MS * Math.pow(2, exponent),
       CloudSync.MAX_RECONNECT_MS,
     );
     console.log(`[cloud-sync] Reconnecting in ${Math.round(delay / 1000)}s (failures: ${this.consecutiveFailures})`);
