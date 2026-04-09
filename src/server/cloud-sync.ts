@@ -37,7 +37,6 @@ export class CloudSync {
   private pushAckPending = new Set<number>();
   private onAuthFailure?: () => void;
   private consecutiveFailures = 0;
-  private static readonly MAX_CONSECUTIVE_FAILURES = 5;
   private static readonly BASE_RECONNECT_MS = 10_000;
   private static readonly MAX_RECONNECT_MS = 5 * 60 * 1000;
 
@@ -79,7 +78,8 @@ export class CloudSync {
 
     this.isAuthenticated = false;
     let didOpen = false;
-    const wsUrl = this.cloudUrl.replace(/^http/, 'ws').replace(/\/?$/, '/ws');
+    const base = this.cloudUrl.replace(/^http/, 'ws').replace(/\/ws\/?$/, '').replace(/\/$/, '');
+    const wsUrl = `${base}/ws`;
     this.ws = new WebSocket(wsUrl);
 
     this.ws.on('open', () => {
@@ -121,17 +121,7 @@ export class CloudSync {
 
       if (!didOpen) {
         this.consecutiveFailures++;
-        console.log(`[cloud-sync] Connection failed without opening (${this.consecutiveFailures}/${CloudSync.MAX_CONSECUTIVE_FAILURES})`);
-        if (this.consecutiveFailures >= CloudSync.MAX_CONSECUTIVE_FAILURES) {
-          console.error('[cloud-sync] Max consecutive connection failures reached — treating as auth failure');
-          insertErrorLog({
-            level: 'error',
-            source: 'cloud-sync',
-            message: `WebSocket failed to connect ${this.consecutiveFailures} times consecutively — giving up`,
-          });
-          this.handleAuthFailure();
-          return;
-        }
+        console.log(`[cloud-sync] Connection failed without opening (attempt ${this.consecutiveFailures})`);
       }
 
       this.scheduleReconnect();
