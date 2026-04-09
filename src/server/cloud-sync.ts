@@ -36,6 +36,10 @@ export class CloudSync {
   private isAuthenticated = false;
   private pushAckPending = new Set<number>();
   private onAuthFailure?: () => void;
+  private consecutiveFailures = 0;
+  private static readonly MAX_CONSECUTIVE_FAILURES = 5;
+  private static readonly BASE_RECONNECT_MS = 10_000;
+  private static readonly MAX_RECONNECT_MS = 5 * 60 * 1000;
 
   constructor(cloudUrl: string, hubToken: string, onAuthFailure?: () => void) {
     this.cloudUrl = cloudUrl;
@@ -74,10 +78,12 @@ export class CloudSync {
     if (!this.isRunning) return;
 
     this.isAuthenticated = false;
-    const wsUrl = this.cloudUrl.replace(/^http/, 'ws');
+    let didOpen = false;
+    const wsUrl = this.cloudUrl.replace(/^http/, 'ws').replace(/\/?$/, '/ws');
     this.ws = new WebSocket(wsUrl);
 
     this.ws.on('open', () => {
+      didOpen = true;
       console.log('[cloud-sync] Connected to cloud');
       this.send({ type: 'hubIdentify', payload: { hubToken: this.hubToken } });
 
@@ -112,6 +118,22 @@ export class CloudSync {
       }
       this.stopHeartbeat();
       this.stopTieredSync();
+
+      if (!didOpen) {
+        this.consecutiveFailures++;
+        console.log(`[cloud-sync] Connection failed without opening (${this.consecutiveFailures}/${CloudSync.MAX_CONSECUTIVE_FAILURES})`);
+        if (this.consecutiveFailures >= CloudSync.MAX_CONSECUTIVE_FAILURES) {
+          console.error('[cloud-sync] Max consecutive connection failures reached — treating as auth failure');
+          insertErrorLog({
+            level: 'error',
+            source: 'cloud-sync',
+            message: `WebSocket failed to connect ${this.consecutiveFailures} times consecutively — giving up`,
+          });
+          this.handleAuthFailure();
+          return;
+        }
+      }
+
       this.scheduleReconnect();
     });
 
@@ -140,6 +162,7 @@ export class CloudSync {
       case 'hubConnected':
         console.log('[cloud-sync] Hub authenticated');
         this.isAuthenticated = true;
+        this.consecutiveFailures = 0;
         if (this.authTimeout) {
           clearTimeout(this.authTimeout);
           this.authTimeout = null;
@@ -255,7 +278,12 @@ export class CloudSync {
 
   private scheduleReconnect() {
     if (!this.isRunning) return;
-    this.reconnectTimeout = setTimeout(() => this.connect(), 10000);
+    const delay = Math.min(
+      CloudSync.BASE_RECONNECT_MS * Math.pow(2, this.consecutiveFailures),
+      CloudSync.MAX_RECONNECT_MS,
+    );
+    console.log(`[cloud-sync] Reconnecting in ${Math.round(delay / 1000)}s (failures: ${this.consecutiveFailures})`);
+    this.reconnectTimeout = setTimeout(() => this.connect(), delay);
   }
 
   private pullChanges(tiers: string[]) {
