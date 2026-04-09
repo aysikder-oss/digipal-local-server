@@ -1037,7 +1037,11 @@ export async function startServer(port: number): Promise<number> {
     );
   });
 
-  app.post('/api/customer/hub/sync', requireAuth, async (_req: Request, res: Response) => {
+  app.post('/api/customer/hub/sync', requireAuth, async (req: Request, res: Response) => {
+    const sub = getSessionSubscriber(req.session.subscriberId);
+    if (!sub || (sub as any).account_role !== 'owner') {
+      return res.status(403).json({ message: 'Only the account owner can trigger hub sync' });
+    }
     if (cloudSync?.isConnected()) {
       cloudSync.triggerForceSync();
       res.json({ sent: true });
@@ -1047,6 +1051,10 @@ export async function startServer(port: number): Promise<number> {
   });
 
   app.post('/api/customer/hub/token/regenerate', requireAuth, async (req: Request, res: Response) => {
+    const sub = getSessionSubscriber(req.session.subscriberId);
+    if (!sub || (sub as any).account_role !== 'owner') {
+      return res.status(403).json({ message: 'Only the account owner can regenerate the hub token' });
+    }
     const syncState = getSyncState();
     if (!syncState?.cloud_session_cookie || !syncState?.cloud_url) {
       return res.status(400).json({ message: 'Not connected to cloud — please log out and log back in first' });
