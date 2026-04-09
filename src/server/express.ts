@@ -29,6 +29,7 @@ let initialSyncStatus: { inProgress: boolean; step: string; error: string | null
 
 let hubReattemptInProgress = false;
 let lastHubReattemptAt = 0;
+let hubRegistrationInProgress = false;
 const HUB_REATTEMPT_COOLDOWN = 60000;
 
 async function getCloudSession(cloudUrl: string, email: string, password: string): Promise<string | null> {
@@ -82,18 +83,25 @@ async function getCloudSession(cloudUrl: string, email: string, password: string
   }
 }
 
-async function verifyHubToken(cloudUrl: string, hubToken: string): Promise<boolean> {
+async function verifyHubToken(cloudUrl: string, hubToken: string): Promise<'valid' | 'invalid' | 'unreachable'> {
   try {
     const res = await fetch(`${cloudUrl}/api/hub/verify`, {
       headers: { 'x-hub-token': hubToken },
     });
-    return res.ok;
+    if (res.ok) return 'valid';
+    if (res.status === 401 || res.status === 404) return 'invalid';
+    return 'unreachable';
   } catch {
-    return false;
+    return 'unreachable';
   }
 }
 
 async function registerHubWithCloud(cloudUrl: string, email: string, password: string, subscriberId: number): Promise<{ hubToken: string; hubId: number } | null> {
+  if (hubRegistrationInProgress) {
+    console.log('[initial-sync] Hub registration already in progress — skipping');
+    return null;
+  }
+
   if (isHubRevoked()) {
     console.log('[initial-sync] Hub was revoked — skipping registration');
     return null;
@@ -102,9 +110,13 @@ async function registerHubWithCloud(cloudUrl: string, email: string, password: s
   const syncState = getSyncState();
   if (syncState?.hub_token) {
     if (syncState.subscriber_id === subscriberId && syncState.cloud_url === cloudUrl) {
-      const tokenValid = await verifyHubToken(cloudUrl, syncState.hub_token);
-      if (tokenValid) {
+      const verifyResult = await verifyHubToken(cloudUrl, syncState.hub_token);
+      if (verifyResult === 'valid') {
         console.log('[initial-sync] Hub token verified against cloud — reusing existing registration');
+        return { hubToken: syncState.hub_token, hubId: 0 };
+      }
+      if (verifyResult === 'unreachable') {
+        console.log('[initial-sync] Cloud unreachable during token verify — keeping existing token');
         return { hubToken: syncState.hub_token, hubId: 0 };
       }
       console.log('[initial-sync] Hub token is stale (cloud returned 401) — clearing and re-registering');
@@ -125,6 +137,7 @@ async function registerHubWithCloud(cloudUrl: string, email: string, password: s
   const hubName = `${os.hostname()} Local Server`;
   console.log(`[initial-sync] Registering hub "${hubName}" with cloud at ${cloudUrl}/api/hub/register`);
 
+  hubRegistrationInProgress = true;
   try {
     const res = await fetch(`${cloudUrl}/api/hub/register`, {
       method: 'POST',
@@ -158,6 +171,8 @@ async function registerHubWithCloud(cloudUrl: string, email: string, password: s
   } catch (e: any) {
     console.error('[initial-sync] Hub registration error:', e.message);
     return null;
+  } finally {
+    hubRegistrationInProgress = false;
   }
 }
 
@@ -172,8 +187,14 @@ function startCloudSyncIfNeeded() {
       updateSyncState({ hub_token: null, hub_name: null, hub_revoked: 0 });
       initialSyncStatus = { inProgress: false, step: '', error: 'Hub token rejected — please log out and log back in to re-register', completedAt: null };
 
+      if (hubRegistrationInProgress) {
+        console.log('[cloud-sync] Registration already in progress — skipping re-registration');
+        return;
+      }
+
       const currentState = getSyncState();
       if (currentState?.cloud_session_cookie && currentState?.subscriber_id && currentState?.cloud_url) {
+        hubRegistrationInProgress = true;
         console.log('[cloud-sync] Attempting automatic re-registration via saved session cookie...');
         const hubName = `${os.hostname()} Local Server`;
         fetch(`${currentState.cloud_url}/api/hub/register-session`, {
@@ -194,6 +215,8 @@ function startCloudSyncIfNeeded() {
           }
         }).catch((e: any) => {
           console.log(`[cloud-sync] Session-based re-registration error: ${e.message}`);
+        }).finally(() => {
+          hubRegistrationInProgress = false;
         });
       }
     });
@@ -286,12 +309,15 @@ async function autoSyncOnStartup() {
     return;
   }
 
-  const tokenValid = await verifyHubToken(syncState.cloud_url, syncState.hub_token);
-  if (!tokenValid) {
+  const verifyResult = await verifyHubToken(syncState.cloud_url, syncState.hub_token);
+  if (verifyResult === 'invalid') {
     console.log('[auto-sync] Hub token is stale (cloud returned 401) — clearing for re-registration on next login');
     updateSyncState({ hub_token: null, hub_name: null });
     initialSyncStatus = { inProgress: false, step: '', error: 'Hub token expired — please log in to re-register', completedAt: null };
     return;
+  }
+  if (verifyResult === 'unreachable') {
+    console.log('[auto-sync] Cloud unreachable during token verify — proceeding with existing token');
   }
 
   startCloudSyncIfNeeded();

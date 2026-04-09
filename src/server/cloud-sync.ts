@@ -106,6 +106,10 @@ export class CloudSync {
 
     this.ws.on('close', () => {
       console.log('[cloud-sync] Disconnected from cloud');
+      if (this.authTimeout) {
+        clearTimeout(this.authTimeout);
+        this.authTimeout = null;
+      }
       this.stopHeartbeat();
       this.stopTieredSync();
       this.scheduleReconnect();
