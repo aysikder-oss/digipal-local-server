@@ -260,10 +260,10 @@ const CLOUD_SYNC_ENDPOINTS = [
   { path: '/api/customer/screen-groups', table: 'screen_groups' },
   { path: '/api/customer/broadcasts', table: 'broadcasts' },
   { path: '/api/customer/qr-codes', table: 'smart_qr_codes' },
-  { path: '/api/customer/widgets', table: 'widgets' },
   { path: '/api/customer/video-walls', table: 'video_walls' },
   { path: '/api/customer/kiosks', table: 'kiosks' },
   { path: '/api/customer/smart-triggers', table: 'smart_triggers' },
+  { path: '/api/customer/design-templates', table: 'design_templates' },
 ];
 
 async function pullAllDataFromCloud(cloudUrl: string, sessionCookie: string, onStep?: (step: string) => void): Promise<number> {
@@ -283,7 +283,8 @@ async function pullAllDataFromCloud(cloudUrl: string, sessionCookie: string, onS
       const raw = await res.json();
       const data = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' && Array.isArray(raw.data)) ? raw.data : null;
       if (!data || data.length === 0) {
-        console.log(`[cloud-pull] ${ep.table}: ${data ? '0 rows' : 'non-array response'}`);
+        const responseType = raw === null ? 'null' : Array.isArray(raw) ? 'empty array' : typeof raw === 'object' ? `object with keys: ${Object.keys(raw).join(',')}` : typeof raw;
+        console.log(`[cloud-pull] ${ep.table}: ${data ? '0 rows' : `non-array response (${responseType})`}`);
         continue;
       }
 
@@ -318,6 +319,11 @@ const FULL_PULL_TABLE_MAP: Record<string, string> = {
   playlistItems: 'playlist_items',
   videoWalls: 'video_walls',
   kiosks: 'kiosks',
+  broadcasts: 'broadcasts',
+  smartQrCodes: 'smart_qr_codes',
+  smartTriggers: 'smart_triggers',
+  screenGroups: 'screen_groups',
+  designTemplates: 'design_templates',
 };
 
 async function pullFullDataViaHubToken(cloudUrl: string, hubToken: string): Promise<number> {
@@ -369,23 +375,82 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
   if (hubResult) {
     startCloudSyncIfNeeded();
   } else {
-    console.log('[initial-sync] Hub registration failed — continuing with REST-based sync only');
+    console.log('[initial-sync] Hub registration via password failed — will try session-based registration');
   }
 
   initialSyncStatus.step = 'Authenticating with cloud...';
 
   const sessionCookie = await getCloudSession(cloudUrl, email, password);
   if (!sessionCookie) {
-    initialSyncStatus = { inProgress: false, step: '', error: 'Could not authenticate with cloud for data sync', completedAt: null };
+    console.log('[initial-sync] Could not get cloud session');
+    if (hubResult) {
+      initialSyncStatus.step = 'Pulling data from cloud...';
+      try {
+        const syncState = getSyncState();
+        const totalSynced = await pullFullDataViaHubToken(syncState!.cloud_url, syncState!.hub_token);
+        console.log(`[initial-sync] Full pull via hub token complete — ${totalSynced} rows`);
+        initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
+      } catch (e: any) {
+        console.error('[initial-sync] Full pull via hub token failed:', e.message);
+        initialSyncStatus = { inProgress: false, step: '', error: 'Failed to pull data', completedAt: null };
+      }
+    } else {
+      initialSyncStatus = { inProgress: false, step: '', error: 'Could not authenticate with cloud for data sync', completedAt: null };
+    }
     return;
   }
 
   updateSyncState({ cloud_session_cookie: sessionCookie });
-  console.log('[initial-sync] Cloud session obtained and saved, starting full data pull...');
+  console.log('[initial-sync] Cloud session obtained and saved');
 
-  const totalSynced = await pullAllDataFromCloud(cloudUrl, sessionCookie, (step) => {
-    initialSyncStatus.step = step;
-  });
+  if (!hubResult) {
+    console.log('[initial-sync] Trying session-based hub registration...');
+    initialSyncStatus.step = 'Registering local server...';
+    try {
+      const hubName = `${os.hostname()} Local Server`;
+      const regRes = await fetch(`${cloudUrl}/api/hub/register-session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Cookie': sessionCookie },
+        body: JSON.stringify({ name: hubName }),
+      });
+      if (regRes.ok) {
+        const result = await regRes.json() as any;
+        if (result.hubToken) {
+          updateSyncState({ hub_token: result.hubToken, cloud_url: cloudUrl, subscriber_id: subscriberId, hub_name: hubName, hub_revoked: 0 });
+          console.log(`[initial-sync] Hub registered via session — hubId: ${result.hubId}`);
+          startCloudSyncIfNeeded();
+        }
+      } else {
+        const errBody = await regRes.text().catch(() => '');
+        console.log(`[initial-sync] Session-based hub registration failed: HTTP ${regRes.status} — ${errBody.substring(0, 200)}`);
+      }
+    } catch (e: any) {
+      console.log(`[initial-sync] Session-based hub registration error: ${e.message}`);
+    }
+  }
+
+  initialSyncStatus.step = 'Pulling data from cloud...';
+
+  const syncState = getSyncState();
+  let totalSynced = 0;
+
+  if (syncState?.hub_token) {
+    console.log('[initial-sync] Pulling data via hub token (full pull)...');
+    try {
+      totalSynced = await pullFullDataViaHubToken(syncState.cloud_url, syncState.hub_token);
+      console.log(`[initial-sync] Hub token pull complete — ${totalSynced} rows`);
+    } catch (e: any) {
+      console.error('[initial-sync] Hub token pull failed, falling back to REST:', e.message);
+      totalSynced = 0;
+    }
+  }
+
+  if (totalSynced === 0) {
+    console.log('[initial-sync] Pulling data via REST endpoints...');
+    totalSynced = await pullAllDataFromCloud(cloudUrl, sessionCookie, (step) => {
+      initialSyncStatus.step = step;
+    });
+  }
 
   initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
   console.log(`[initial-sync] Initial cloud data sync complete — ${totalSynced} total rows`);
