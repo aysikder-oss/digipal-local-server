@@ -6,7 +6,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import os from 'os';
-import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount, getUnpushedChanges, getFullRow, markChangesPushed, upsertRow, withoutTriggers, SYNCED_TABLES } from '../db/sqlite';
+import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount, getUnpushedChanges, getFullRow, markChangesPushed, upsertRow, withoutTriggers, SYNCED_TABLES, insertErrorLog, getRecentErrorLogs, getErrorLogCount, pruneOldErrorLogs } from '../db/sqlite';
 import { startMdns, stopMdns, scanForExistingHubs } from './mdns';
 import { CloudSync } from './cloud-sync';
 import { getConnectedPlayers, registerPlayer, unregisterPlayer, broadcastToPlayers } from './player-bus';
@@ -26,6 +26,10 @@ const storage = new SqliteStorage();
 let initialSyncStatus: { inProgress: boolean; step: string; error: string | null; completedAt: string | null } = {
   inProgress: false, step: '', error: null, completedAt: null,
 };
+
+let hubReattemptInProgress = false;
+let lastHubReattemptAt = 0;
+const HUB_REATTEMPT_COOLDOWN = 60000;
 
 async function getCloudSession(cloudUrl: string, email: string, password: string): Promise<string | null> {
   try {
@@ -452,8 +456,22 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
     });
   }
 
-  initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
-  console.log(`[initial-sync] Initial cloud data sync complete — ${totalSynced} total rows`);
+  const finalSyncState = getSyncState();
+  const hubRegistered = !!finalSyncState?.hub_token && !finalSyncState?.hub_revoked;
+
+  if (hubRegistered) {
+    initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
+    console.log(`[initial-sync] Initial cloud data sync complete — ${totalSynced} total rows`);
+  } else {
+    initialSyncStatus = { inProgress: false, step: '', error: 'Hub registration failed — data was synced via REST but real-time sync is not active', completedAt: null };
+    console.log(`[initial-sync] Data sync finished (${totalSynced} rows) but hub registration failed — no hub token`);
+    insertErrorLog({
+      level: 'warn',
+      source: 'initial-sync',
+      message: 'Initial sync completed but hub registration failed — no hub token obtained',
+      context: { subscriberId, totalSynced },
+    });
+  }
 }
 
 const MAX_UPLOAD_SIZE = 500 * 1024 * 1024;
@@ -793,7 +811,47 @@ function parseMultipart(fieldName: string) {
 }
 
 export async function startServer(port: number): Promise<number> {
-  initSessionTable();
+  process.on('uncaughtException', (err) => {
+    console.error('[startup] Uncaught exception:', err.message);
+    try {
+      insertErrorLog({
+        level: 'critical',
+        source: 'process',
+        message: `Uncaught exception: ${err.message}`,
+        stack: err.stack,
+        context: { phase: 'runtime' },
+      });
+    } catch {}
+  });
+
+  process.on('unhandledRejection', (reason: any) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : undefined;
+    console.error('[startup] Unhandled rejection:', msg);
+    try {
+      insertErrorLog({
+        level: 'error',
+        source: 'process',
+        message: `Unhandled rejection: ${msg}`,
+        stack,
+        context: { phase: 'runtime' },
+      });
+    } catch {}
+  });
+
+  try {
+    initSessionTable();
+  } catch (err: any) {
+    insertErrorLog({
+      level: 'critical',
+      source: 'startup',
+      message: `Session table init failed: ${err.message}`,
+      stack: err.stack,
+      context: { phase: 'startup' },
+    });
+    throw err;
+  }
+
   cleanExpiredSessions();
   sessionCleanupInterval = setInterval(() => cleanExpiredSessions(), 60 * 60 * 1000);
 
@@ -846,7 +904,20 @@ export async function startServer(port: number): Promise<number> {
       res.json = function(body: any) {
         const ms = Date.now() - start;
         if (res.statusCode >= 400) {
-          console.error(`[http] ${req.method} ${req.originalUrl} → ${res.statusCode} (${ms}ms) session=${!!req.session?.subscriberId} body=${JSON.stringify(body)?.slice(0, 500)}`);
+          const bodyStr = JSON.stringify(body)?.slice(0, 500);
+          console.error(`[http] ${req.method} ${req.originalUrl} → ${res.statusCode} (${ms}ms) session=${!!req.session?.subscriberId} body=${bodyStr}`);
+          if (res.statusCode >= 500) {
+            insertErrorLog({
+              level: 'error',
+              source: 'api',
+              route: req.originalUrl,
+              method: req.method,
+              statusCode: res.statusCode,
+              message: body?.message || body?.error || `HTTP ${res.statusCode}`,
+              stack: body?.stack || undefined,
+              context: { responseTime: ms, subscriberId: req.session?.subscriberId },
+            });
+          }
         }
         return origJson(body);
       };
@@ -857,15 +928,47 @@ export async function startServer(port: number): Promise<number> {
   app.get('/api/diagnostics', (_req: Request, res: Response) => {
     try {
       const db = getDb();
-      const tables = ['screens', 'contents', 'playlists', 'schedules', 'subscribers', 'content_folders', 'broadcasts', 'design_templates', 'kiosks', 'video_walls'];
+      const tables = ['screens', 'contents', 'playlists', 'schedules', 'subscribers', 'content_folders', 'broadcasts', 'design_templates', 'kiosks', 'video_walls', 'error_logs'];
       const counts: Record<string, number> = {};
       for (const t of tables) {
         try { counts[t] = (db.prepare(`SELECT COUNT(*) as c FROM ${t}`).get() as any).c; } catch { counts[t] = -1; }
       }
       const sessions = db.prepare('SELECT id, subscriber_id, created_at FROM sessions').all();
       const syncState = getSyncState();
-      res.json({ ok: true, counts, sessions, syncState: { hub_token: syncState?.hub_token ? '***' : null, cloud_url: syncState?.cloud_url, last_sync_at: syncState?.last_sync_at, hub_revoked: syncState?.hub_revoked } });
+      const recentErrors = getRecentErrorLogs(10);
+      const unpushedChanges = getUnpushedChangeCount();
+      const version = require('../../package.json').version;
+      res.json({
+        ok: true,
+        version,
+        counts,
+        sessions,
+        syncState: {
+          hub_token: syncState?.hub_token ? '***' : null,
+          cloud_url: syncState?.cloud_url,
+          last_sync_at: syncState?.last_sync_at,
+          last_cloud_contact_at: syncState?.last_cloud_contact_at,
+          hub_revoked: syncState?.hub_revoked,
+          sync_enabled: syncState?.sync_enabled,
+        },
+        unpushedChanges,
+        recentErrors,
+        cloudSyncConnected: cloudSync?.isConnected() ?? false,
+        hubBlocked,
+        uptime: process.uptime(),
+        memoryUsage: process.memoryUsage(),
+      });
     } catch (e: any) { res.json({ ok: false, error: e.message, stack: e.stack }); }
+  });
+
+  app.get('/api/diagnostics/errors', (_req: Request, res: Response) => {
+    try {
+      const limit = Math.min(parseInt(_req.query.limit as string) || 50, 200);
+      const offset = parseInt(_req.query.offset as string) || 0;
+      const errors = getRecentErrorLogs(limit, offset);
+      const total = getErrorLogCount();
+      res.json({ errors, total, limit, offset });
+    } catch (e: any) { res.json({ errors: [], total: 0, error: e.message }); }
   });
 
   app.post('/api/customer/login', async (req: Request, res: Response) => {
@@ -874,19 +977,55 @@ export async function startServer(port: number): Promise<number> {
     if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
     const result = await authenticateUser(email, password);
     if (!result.success) return res.status(401).json({ message: result.error });
-    const sessionId = createSession(result.subscriber!.id);
-    res.setHeader('Set-Cookie', `session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`);
-    res.json(result.subscriber);
 
+    const subscriber = result.subscriber!;
     const syncState = getSyncState();
     const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
-    runInitialCloudSync(result.subscriber!.id as number, cloudUrl, email, password).catch(e =>
-      console.error('[initial-sync] Error:', e.message)
-    );
+    const isOwner = subscriber.accountRole === 'owner';
+    const hubAlreadyRegistered = !!syncState?.hub_token && !syncState?.hub_revoked;
+
+    if (!isOwner && !hubAlreadyRegistered) {
+      return res.status(403).json({ message: 'This local server has not been set up yet. The account owner must log in first to register this hub.' });
+    }
+
+    const sessionId = createSession(subscriber.id);
+    res.setHeader('Set-Cookie', `session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`);
+
+    if (isOwner && !hubAlreadyRegistered) {
+      const syncPromise = runInitialCloudSync(subscriber.id as number, cloudUrl, email, password);
+      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 15000));
+      await Promise.race([syncPromise, timeoutPromise]).catch(e =>
+        console.error('[initial-sync] Error during login-await:', e.message)
+      );
+
+      const updatedSyncState = getSyncState();
+      const syncSucceeded = !!updatedSyncState?.hub_token && !updatedSyncState?.hub_revoked;
+      res.json({
+        ...subscriber,
+        syncStatus: syncSucceeded ? 'complete' : 'pending',
+        syncError: syncSucceeded ? null : (initialSyncStatus.error || 'Hub registration still in progress'),
+      });
+    } else {
+      if (isOwner) {
+        runInitialCloudSync(subscriber.id as number, cloudUrl, email, password).catch(e =>
+          console.error('[initial-sync] Error:', e.message)
+        );
+      }
+      res.json({
+        ...subscriber,
+        syncStatus: hubAlreadyRegistered ? 'complete' : 'not_required',
+        syncError: null,
+      });
+    }
   });
 
   app.get('/api/customer/sync-status', requireAuth, (_req: Request, res: Response) => {
-    res.json(initialSyncStatus);
+    const currentSyncState = getSyncState();
+    const hubRegistered = !!currentSyncState?.hub_token && !currentSyncState?.hub_revoked;
+    res.json({
+      ...initialSyncStatus,
+      hubRegistered,
+    });
   });
 
   app.post('/api/customer/force-sync', requireAuth, async (req: Request, res: Response) => {
@@ -1161,11 +1300,54 @@ export async function startServer(port: number): Promise<number> {
     const perms = resolvePermissions(sub.id);
     const role = (sub as any).account_role || (sub as any).accountRole || 'viewer';
     const now = new Date().toISOString();
+    const currentSyncState = getSyncState();
+    const hubRegistered = !!currentSyncState?.hub_token && !currentSyncState?.hub_revoked;
+
+    if (role === 'owner' && !hubRegistered && !initialSyncStatus.inProgress && !hubReattemptInProgress) {
+      const timeSinceLastAttempt = Date.now() - lastHubReattemptAt;
+      if (timeSinceLastAttempt > HUB_REATTEMPT_COOLDOWN) {
+        hubReattemptInProgress = true;
+        lastHubReattemptAt = Date.now();
+        const cloudUrl = currentSyncState?.cloud_url || 'https://digipalsignage.com';
+        const cloudCookie = currentSyncState?.cloud_session_cookie;
+        if (cloudCookie) {
+          console.log('[me] Owner session detected without hub registration — attempting session-based registration');
+          (async () => {
+            try {
+              const hubName = `${os.hostname()} Local Server`;
+              const regRes = await fetch(`${cloudUrl}/api/hub/register-session`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Cookie': cloudCookie },
+                body: JSON.stringify({ name: hubName }),
+              });
+              if (regRes.ok) {
+                const result = await regRes.json() as any;
+                if (result.hubToken) {
+                  updateSyncState({ hub_token: result.hubToken, cloud_url: cloudUrl, subscriber_id: sub.id, hub_name: hubName, hub_revoked: 0 });
+                  console.log(`[me] Hub registered via cached session — hubId: ${result.hubId}`);
+                  startCloudSyncIfNeeded();
+                  initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
+                }
+              }
+            } catch (e: any) {
+              console.log(`[me] Hub reattempt failed: ${e.message}`);
+            } finally {
+              hubReattemptInProgress = false;
+            }
+          })();
+        } else {
+          hubReattemptInProgress = false;
+        }
+      }
+    }
+
     res.json({
       ...sub,
       accountRole: role,
       consentTosAt: (sub as any).consentTosAt || now,
       consentPrivacyAt: (sub as any).consentPrivacyAt || now,
+      hubRegistered,
+      syncStatus: hubRegistered ? 'complete' : (initialSyncStatus.inProgress || hubReattemptInProgress ? 'pending' : 'not_started'),
       workspace: {
         teamId: null,
         teamName: null,
@@ -1314,16 +1496,40 @@ export async function startServer(port: number): Promise<number> {
     const result = await authenticateUser(email, password);
     if (!result.success) return res.status(401).json({ message: result.error });
 
-    const sessionId = createSession(result.subscriber!.id);
-
-    res.setHeader('Set-Cookie', `session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`);
-    res.json({ subscriber: result.subscriber, token: sessionId });
-
+    const subscriber = result.subscriber!;
     const syncState = getSyncState();
     const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
-    runInitialCloudSync(result.subscriber!.id, cloudUrl, email, password).catch(e =>
-      console.error('[auth/login] Cloud sync error:', e.message)
-    );
+    const isOwner = subscriber.accountRole === 'owner';
+    const hubAlreadyRegistered = !!syncState?.hub_token && !syncState?.hub_revoked;
+
+    if (!isOwner && !hubAlreadyRegistered) {
+      return res.status(403).json({ message: 'This local server has not been set up yet. The account owner must log in first to register this hub.' });
+    }
+
+    const sessionId = createSession(subscriber.id);
+    res.setHeader('Set-Cookie', `session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`);
+
+    if (isOwner && !hubAlreadyRegistered) {
+      const syncPromise = runInitialCloudSync(subscriber.id, cloudUrl, email, password);
+      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 15000));
+      await Promise.race([syncPromise, timeoutPromise]).catch(e =>
+        console.error('[auth/login] Cloud sync error during login-await:', e.message)
+      );
+
+      const updatedSyncState = getSyncState();
+      const syncSucceeded = !!updatedSyncState?.hub_token && !updatedSyncState?.hub_revoked;
+      res.json({
+        subscriber: { ...subscriber, syncStatus: syncSucceeded ? 'complete' : 'pending' },
+        token: sessionId,
+      });
+    } else {
+      if (isOwner) {
+        runInitialCloudSync(subscriber.id, cloudUrl, email, password).catch(e =>
+          console.error('[auth/login] Cloud sync error:', e.message)
+        );
+      }
+      res.json({ subscriber: { ...subscriber, syncStatus: 'complete' }, token: sessionId });
+    }
   });
 
   app.post('/api/auth/logout', (req: Request, res: Response) => {
@@ -2929,6 +3135,16 @@ export async function startServer(port: number): Promise<number> {
 
   app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
     console.error(`[global-error] ${req.method} ${req.originalUrl}:`, err.message, err.stack);
+    insertErrorLog({
+      level: 'error',
+      source: 'global-error-handler',
+      route: req.originalUrl,
+      method: req.method,
+      statusCode: 500,
+      message: err.message || 'Unknown server error',
+      stack: err.stack,
+      context: { subscriberId: req.session?.subscriberId },
+    });
     if (!res.headersSent) {
       res.status(500).json({ message: err.message, route: req.originalUrl, stack: err.stack?.split('\n').slice(0, 5) });
     }

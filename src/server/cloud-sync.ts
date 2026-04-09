@@ -12,6 +12,10 @@ import {
   setHubRevoked,
   updateCloudContactTime,
   enforceLocalFreeScreenLimit,
+  getUnsentErrorLogs,
+  markErrorLogsSent,
+  pruneOldErrorLogs,
+  insertErrorLog,
 } from '../db/sqlite';
 import { broadcastToPlayers } from './player-bus';
 
@@ -26,6 +30,7 @@ export class CloudSync {
   private standardSyncInterval: NodeJS.Timeout | null = null;
   private lazySyncInterval: NodeJS.Timeout | null = null;
   private reconnectTimeout: NodeJS.Timeout | null = null;
+  private errorReportInterval: NodeJS.Timeout | null = null;
   private isRunning = false;
   private pushAckPending = new Set<number>();
 
@@ -38,6 +43,12 @@ export class CloudSync {
     if (this.isRunning) return;
     this.isRunning = true;
     this.connect();
+    if (!this.errorReportInterval) {
+      this.reportErrorsToCloud();
+      this.errorReportInterval = setInterval(() => {
+        this.reportErrorsToCloud();
+      }, 5 * 60 * 1000);
+    }
   }
 
   stop() {
@@ -46,6 +57,7 @@ export class CloudSync {
     if (this.standardSyncInterval) clearInterval(this.standardSyncInterval);
     if (this.lazySyncInterval) clearInterval(this.lazySyncInterval);
     if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
+    if (this.errorReportInterval) clearInterval(this.errorReportInterval);
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -83,6 +95,11 @@ export class CloudSync {
 
     this.ws.on('error', (err) => {
       console.error('[cloud-sync] Connection error:', err.message);
+      insertErrorLog({
+        level: 'error',
+        source: 'cloud-sync',
+        message: `WebSocket connection error: ${err.message}`,
+      });
     });
   }
 
@@ -272,6 +289,13 @@ export class CloudSync {
           }
         } catch (err: any) {
           console.error(`[cloud-sync] Failed to apply change to ${change.tableName}:`, err.message);
+          insertErrorLog({
+            level: 'error',
+            source: 'cloud-sync',
+            message: `Failed to apply change to ${change.tableName}: ${err.message}`,
+            stack: err.stack,
+            context: { tableName: change.tableName, operation: change.operation, recordId: change.recordId },
+          });
         }
       }
     });
@@ -307,6 +331,47 @@ export class CloudSync {
   private send(message: any) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
+    }
+  }
+
+  private async reportErrorsToCloud() {
+    try {
+      const unsent = getUnsentErrorLogs(100);
+      if (unsent.length === 0) return;
+
+      const httpUrl = this.cloudUrl.replace(/^ws/, 'http');
+      const res = await fetch(`${httpUrl}/api/hub/report-errors`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Hub-Token': this.hubToken,
+        },
+        body: JSON.stringify({
+          errors: unsent.map((e: any) => ({
+            level: e.level,
+            source: e.source,
+            route: e.route,
+            method: e.method,
+            statusCode: e.status_code,
+            message: e.message,
+            stack: e.stack,
+            context: e.context ? JSON.parse(e.context) : null,
+            timestamp: e.timestamp,
+          })),
+        }),
+      });
+
+      if (res.ok) {
+        const ids = unsent.map((e: any) => e.id);
+        markErrorLogsSent(ids);
+        console.log(`[cloud-sync] Reported ${ids.length} errors to cloud`);
+      } else {
+        console.log(`[cloud-sync] Error report failed: HTTP ${res.status}`);
+      }
+
+      pruneOldErrorLogs(1000);
+    } catch (e: any) {
+      console.log(`[cloud-sync] Error reporting failed: ${e.message}`);
     }
   }
 }

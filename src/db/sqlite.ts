@@ -1078,6 +1078,22 @@ export function initDatabase() {
       created_at TEXT DEFAULT (datetime('now')),
       last_seen_at TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS error_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT DEFAULT (datetime('now')),
+      level TEXT NOT NULL DEFAULT 'error',
+      source TEXT NOT NULL DEFAULT 'api',
+      route TEXT,
+      method TEXT,
+      status_code INTEGER,
+      message TEXT NOT NULL,
+      stack TEXT,
+      context TEXT,
+      sent_to_cloud INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_error_logs_sent ON error_logs(sent_to_cloud) WHERE sent_to_cloud = 0;
+    CREATE INDEX IF NOT EXISTS idx_error_logs_timestamp ON error_logs(timestamp);
   `);
 
   setupChangeTriggers(db);
@@ -1266,4 +1282,63 @@ export function withoutTriggers(fn: () => void): void {
 
 export function invalidateColumnCache(): void {
   tableColumnsCache = null;
+}
+
+export interface ErrorLogEntry {
+  level?: string;
+  source: string;
+  route?: string;
+  method?: string;
+  statusCode?: number;
+  message: string;
+  stack?: string;
+  context?: Record<string, unknown>;
+}
+
+export function insertErrorLog(entry: ErrorLogEntry): void {
+  try {
+    db.prepare(`
+      INSERT INTO error_logs (level, source, route, method, status_code, message, stack, context)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      entry.level || 'error',
+      entry.source,
+      entry.route || null,
+      entry.method || null,
+      entry.statusCode || null,
+      entry.message.slice(0, 2000),
+      entry.stack?.slice(0, 4000) || null,
+      entry.context ? JSON.stringify(entry.context) : null
+    );
+  } catch {
+  }
+}
+
+export function getRecentErrorLogs(limit = 50, offset = 0): any[] {
+  return db.prepare('SELECT * FROM error_logs ORDER BY id DESC LIMIT ? OFFSET ?').all(limit, offset);
+}
+
+export function getErrorLogCount(): number {
+  const row = db.prepare('SELECT COUNT(*) as count FROM error_logs').get() as any;
+  return row?.count || 0;
+}
+
+export function getUnsentErrorLogs(limit = 100): any[] {
+  return db.prepare('SELECT * FROM error_logs WHERE sent_to_cloud = 0 ORDER BY id ASC LIMIT ?').all(limit);
+}
+
+export function markErrorLogsSent(ids: number[]): void {
+  if (ids.length === 0) return;
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`UPDATE error_logs SET sent_to_cloud = 1 WHERE id IN (${placeholders})`).run(...ids);
+}
+
+export function pruneOldErrorLogs(keepCount = 1000): void {
+  try {
+    const total = getErrorLogCount();
+    if (total > keepCount) {
+      db.prepare(`DELETE FROM error_logs WHERE id NOT IN (SELECT id FROM error_logs ORDER BY id DESC LIMIT ?)`).run(keepCount);
+    }
+  } catch {
+  }
 }
