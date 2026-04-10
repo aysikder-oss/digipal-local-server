@@ -1369,6 +1369,36 @@ export async function startServer(port: number): Promise<number> {
     res.json({ ok: true });
   });
 
+  app.post('/api/customer/logout-and-reset', (_req: Request, res: Response) => {
+    try {
+      console.log('[logout-reset] Clearing all sessions and sync state...');
+      if (cloudSync) {
+        cloudSync.stop();
+        cloudSync = null;
+      }
+      updateSyncState({
+        hub_token: null,
+        hub_name: null,
+        subscriber_id: null,
+        cloud_url: null,
+        cloud_session_cookie: null,
+        hub_revoked: 0,
+        last_sync_at: null,
+        last_cloud_contact_at: null,
+        sync_enabled: 1,
+      });
+      const db = getDb();
+      db.prepare('DELETE FROM sessions').run();
+      initialSyncStatus = { inProgress: false, step: '', error: '', completedAt: null };
+      res.setHeader('Set-Cookie', 'session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+      console.log('[logout-reset] Reset complete — ready for fresh login');
+      res.json({ ok: true });
+    } catch (e: any) {
+      console.error('[logout-reset] Error:', e.message);
+      res.status(500).json({ message: e.message });
+    }
+  });
+
   app.get('/api/customer/me', requireAuth, async (req: Request, res: Response) => {
     const sub = getSessionSubscriber(req.session.subscriberId);
     if (!sub) return res.status(401).json({ message: 'Session expired' });
