@@ -1191,8 +1191,29 @@ export function upsertRow(tableName: string, data: Record<string, any>): void {
   const cols = keys.join(', ');
   const placeholders = keys.map(() => '?').join(', ');
   const updates = keys.filter(k => k !== 'id').map(k => `${k} = excluded.${k}`).join(', ');
-  db.prepare(`INSERT INTO ${tableName} (${cols}) VALUES (${placeholders}) ON CONFLICT(id) DO UPDATE SET ${updates}`)
-    .run(...keys.map(k => normalized[k]));
+  const values = keys.map(k => normalized[k]);
+  const sql = `INSERT INTO ${tableName} (${cols}) VALUES (${placeholders}) ON CONFLICT(id) DO UPDATE SET ${updates}`;
+  try {
+    db.prepare(sql).run(...values);
+  } catch (e: any) {
+    if (e.message && e.message.includes('UNIQUE constraint failed')) {
+      const match = e.message.match(/UNIQUE constraint failed: \w+\.(\w+)/);
+      if (match) {
+        const conflictCol = match[1];
+        if (conflictCol !== 'id' && normalized[conflictCol] !== undefined) {
+          db.prepare(`DELETE FROM ${tableName} WHERE ${conflictCol} = ? AND id != ?`).run(normalized[conflictCol], normalized['id']);
+          db.prepare(sql).run(...values);
+          return;
+        }
+      }
+      if (normalized['id'] !== undefined) {
+        db.prepare(`DELETE FROM ${tableName} WHERE id = ?`).run(normalized['id']);
+        db.prepare(`INSERT INTO ${tableName} (${cols}) VALUES (${placeholders})`).run(...values);
+        return;
+      }
+    }
+    throw e;
+  }
 }
 
 export function deleteRow(tableName: string, recordId: number): void {

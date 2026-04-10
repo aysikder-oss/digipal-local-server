@@ -229,7 +229,10 @@ async function autoSyncOnStartup() {
 
   const contentCount = (db.prepare('SELECT COUNT(*) as c FROM contents').get() as any)?.c || 0;
   const screenCount = (db.prepare('SELECT COUNT(*) as c FROM screens').get() as any)?.c || 0;
-  if ((contentCount === 0 && screenCount === 0) || !syncState.last_sync_at) {
+  const licenseCount = (db.prepare('SELECT COUNT(*) as c FROM licenses').get() as any)?.c || 0;
+  const playlistCount = (db.prepare('SELECT COUNT(*) as c FROM playlists').get() as any)?.c || 0;
+  const needsFullPull = !syncState.last_sync_at || contentCount === 0 || screenCount === 0 || licenseCount === 0 || playlistCount === 0;
+  if (needsFullPull) {
     console.log('[auto-sync] No local data or never synced — attempting full data pull...');
     initialSyncStatus = { inProgress: true, step: 'Pulling data from cloud...', error: null, completedAt: null };
     try {
@@ -256,6 +259,8 @@ const CLOUD_SYNC_ENDPOINTS = [
   { path: '/api/customer/kiosks', table: 'kiosks' },
   { path: '/api/customer/smart-triggers', table: 'smart_triggers' },
   { path: '/api/customer/design-templates', table: 'design_templates' },
+  { path: '/api/customer/licenses', table: 'licenses' },
+  { path: '/api/customer/subscription-groups', table: 'subscription_groups' },
 ];
 
 async function pullAllDataFromCloud(cloudUrl: string, sessionCookie: string, onStep?: (step: string) => void): Promise<number> {
@@ -316,6 +321,8 @@ const FULL_PULL_TABLE_MAP: Record<string, string> = {
   smartTriggers: 'smart_triggers',
   screenGroups: 'screen_groups',
   designTemplates: 'design_templates',
+  licenses: 'licenses',
+  subscriptionGroups: 'subscription_groups',
 };
 
 async function pullFullDataViaHubToken(cloudUrl: string, hubToken: string): Promise<number> {
@@ -1026,15 +1033,14 @@ export async function startServer(port: number): Promise<number> {
     const syncState = getSyncState();
     const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
 
-    const db = getDb();
-    db.prepare('DELETE FROM screens WHERE owner_id = ?').run(req.session.subscriberId);
-    db.prepare('DELETE FROM contents WHERE owner_id = ?').run(req.session.subscriberId);
-    db.prepare('DELETE FROM playlists WHERE owner_id = ?').run(req.session.subscriberId);
-
     res.json({ message: 'Sync started' });
-    runInitialCloudSync(req.session.subscriberId, cloudUrl, email, password).catch(e =>
-      console.error('[force-sync] Error:', e.message)
-    );
+
+    try {
+      await runInitialCloudSync(req.session.subscriberId, cloudUrl, email, password);
+      console.log('[force-sync] Sync completed successfully');
+    } catch (e: any) {
+      console.error('[force-sync] Error:', e.message);
+    }
   });
 
   app.post('/api/customer/hub/sync', requireAuth, async (req: Request, res: Response) => {
