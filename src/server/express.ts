@@ -2023,7 +2023,21 @@ export async function startServer(port: number): Promise<number> {
         } else {
           rows = db.prepare(`SELECT s.* FROM schedules s JOIN screens sc ON s.screen_id = sc.id WHERE sc.owner_id = ? ORDER BY s.created_at DESC`).all(subscriberId);
         }
-        res.json(rows);
+        const normalized = rows.map((row: any) => {
+          const out: any = {};
+          for (const [k, v] of Object.entries(row)) {
+            const camel = k.replace(/_([a-z])/g, (_: string, c: string) => c.toUpperCase());
+            if ((k === 'days_of_week' || k === 'tags') && typeof v === 'string') {
+              try { out[camel] = JSON.parse(v); } catch { out[camel] = []; }
+            } else if ((k === 'days_of_week' || k === 'tags') && v === null) {
+              out[camel] = [];
+            } else {
+              out[camel] = v;
+            }
+          }
+          return out;
+        });
+        res.json(normalized);
       }
     } catch (e: any) { console.error('[route] GET /api/schedules error:', e); res.status(500).json({ message: e.message }); }
   });
