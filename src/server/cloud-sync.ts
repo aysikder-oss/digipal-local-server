@@ -407,9 +407,14 @@ export class CloudSync {
   }
 
   private cachedFeatures: Record<string, boolean> | null = null;
+  private cachedFeaturesAt: number = 0;
+  private static readonly FEATURES_CACHE_TTL = 2 * 60 * 60 * 1000;
 
   getCachedFeatures(): Record<string, boolean> | null {
-    return this.cachedFeatures;
+    if (this.cachedFeatures && (Date.now() - this.cachedFeaturesAt) < CloudSync.FEATURES_CACHE_TTL) {
+      return this.cachedFeatures;
+    }
+    return null;
   }
 
   private async syncSubscriptionFirst(): Promise<void> {
@@ -439,27 +444,50 @@ export class CloudSync {
           }
         }
 
-        if (state.licenses && state.licenses.length > 0) {
+        if (state.licenses && Array.isArray(state.licenses)) {
+          const cloudLicenseIds = new Set(state.licenses.map((l: any) => l.id).filter((id: any) => id !== undefined));
           for (const lic of state.licenses) {
             if (lic && typeof lic.id !== 'undefined') {
               upsertRow('licenses', lic);
             }
           }
-          console.log(`[cloud-sync] Synced ${state.licenses.length} licenses`);
+          if (cloudLicenseIds.size > 0) {
+            const localLicenses = db.prepare('SELECT id FROM licenses').all() as any[];
+            for (const local of localLicenses) {
+              if (!cloudLicenseIds.has(local.id)) {
+                try { deleteRow('licenses', local.id); } catch {}
+              }
+            }
+          } else {
+            db.prepare('DELETE FROM licenses').run();
+          }
+          console.log(`[cloud-sync] Synced ${state.licenses.length} licenses (authoritative)`);
         }
 
-        if (state.subscriptionGroups && state.subscriptionGroups.length > 0) {
+        if (state.subscriptionGroups && Array.isArray(state.subscriptionGroups)) {
+          const cloudGroupIds = new Set(state.subscriptionGroups.map((sg: any) => sg.id).filter((id: any) => id !== undefined));
           for (const sg of state.subscriptionGroups) {
             if (sg && typeof sg.id !== 'undefined') {
               upsertRow('subscription_groups', sg);
             }
           }
-          console.log(`[cloud-sync] Synced ${state.subscriptionGroups.length} subscription groups`);
+          if (cloudGroupIds.size > 0) {
+            const localGroups = db.prepare('SELECT id FROM subscription_groups').all() as any[];
+            for (const local of localGroups) {
+              if (!cloudGroupIds.has(local.id)) {
+                try { deleteRow('subscription_groups', local.id); } catch {}
+              }
+            }
+          } else {
+            db.prepare('DELETE FROM subscription_groups').run();
+          }
+          console.log(`[cloud-sync] Synced ${state.subscriptionGroups.length} subscription groups (authoritative)`);
         }
       });
 
       if (state.features) {
         this.cachedFeatures = state.features;
+        this.cachedFeaturesAt = Date.now();
         console.log('[cloud-sync] Features resolved from subscription:', Object.entries(state.features).filter(([, v]) => v).map(([k]) => k).join(', '));
       }
 

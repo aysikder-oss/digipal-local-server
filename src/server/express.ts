@@ -1502,10 +1502,13 @@ export async function startServer(port: number): Promise<number> {
       return;
     }
     res.json({
-      playlists: true, schedules: true, analytics: true, designStudio: true,
-      smartTriggers: true, aiAnalytics: false, kioskDesigner: true, videoWalls: true,
-      doohAds: false, teamManagement: true, broadcasts: true, knowledgeBase: false,
-      directory: false, screenCast: true, smartQr: true,
+      playlists: true, schedules: false, analytics: false, designStudio: true,
+      smartTriggers: false, aiAnalytics: false, kioskDesigner: false, videoWalls: false,
+      doohAds: false, teamManagement: false, broadcasts: false, knowledgeBase: false,
+      directory: false, screenCast: false, smartQr: false, splitScreen: false,
+      kioskMode: false, remoteControl: false, widgets: false, offlinePlayback: true,
+      remoteView: false, wayfinding: false, wayfinding3d: false,
+      directoryIdleContent: false, emergencyAlerts: false,
     });
   });
 
