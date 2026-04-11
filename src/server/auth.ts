@@ -38,7 +38,8 @@ interface SubscriberRow {
   avatar_url: string | null;
 }
 
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const SESSION_TTL_REMEMBER_MS = 90 * 24 * 60 * 60 * 1000;
 
 function hashPassword(password: string, salt?: string): { hash: string; salt: string } {
   const s = salt || crypto.randomBytes(16).toString('hex');
@@ -71,10 +72,11 @@ export function initSessionTable(): void {
   `);
 }
 
-export function createSession(subscriberId: number): string {
+export function createSession(subscriberId: number, rememberMe: boolean = false): string {
   const db = getDb();
   const sessionId = crypto.randomBytes(32).toString('hex');
-  const expiresAt = Date.now() + SESSION_TTL_MS;
+  const ttl = rememberMe ? SESSION_TTL_REMEMBER_MS : SESSION_TTL_MS;
+  const expiresAt = Date.now() + ttl;
   db.prepare('INSERT INTO sessions (id, subscriber_id, expires_at) VALUES (?, ?, ?)').run(sessionId, subscriberId, expiresAt);
   return sessionId;
 }

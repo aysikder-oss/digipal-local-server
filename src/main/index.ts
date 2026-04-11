@@ -70,6 +70,19 @@ function createWindow() {
     }
   });
 
+  mainWindow.on('show', () => {
+    if (mainWindow) {
+      mainWindow.webContents.executeJavaScript(`
+        (function() {
+          var errEl = document.querySelector('[data-error-boundary="true"]');
+          if (errEl || document.title.includes('Error') || document.body.innerText.includes('Something went wrong')) {
+            window.location.href = '/customer';
+          }
+        })();
+      `).catch(function() {});
+    }
+  });
+
   mainWindow.loadURL(`http://localhost:${SERVER_PORT}`);
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {

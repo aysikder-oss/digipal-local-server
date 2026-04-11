@@ -949,7 +949,7 @@ export async function startServer(port: number): Promise<number> {
 
   app.post('/api/customer/login', async (req: Request, res: Response) => {
     if (hubBlocked) return res.status(503).json({ message: 'Hub is blocked — another Digipal hub was detected on this network. Only one hub is allowed per network.' });
-    const { email, password } = req.body;
+    const { email, password, rememberMe } = req.body;
     if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
     const result = await authenticateUser(email, password);
     if (!result.success) return res.status(401).json({ message: result.error });
@@ -965,8 +965,9 @@ export async function startServer(port: number): Promise<number> {
       return res.status(403).json({ message: 'This local server has not been set up yet. The account owner must log in first to register this hub.' });
     }
 
-    const sessionId = createSession(subscriber.id);
-    res.setHeader('Set-Cookie', `session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 24 * 60 * 60}`);
+    const sessionId = createSession(subscriber.id, !!rememberMe);
+    const cookieMaxAge = rememberMe ? 90 * 24 * 60 * 60 : 24 * 60 * 60;
+    res.setHeader('Set-Cookie', `session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${cookieMaxAge}`);
 
     if (isOwner && !hubAlreadyRegistered) {
       const syncPromise = runInitialCloudSync(subscriber.id as number, cloudUrl, email, password, capturedCookie);
