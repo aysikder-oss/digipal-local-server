@@ -167,9 +167,11 @@ export class CloudSync {
           clearTimeout(this.authTimeout);
           this.authTimeout = null;
         }
-        this.startHeartbeat();
-        this.startTieredSync();
-        this.pullChanges(['realtime', 'standard', 'lazy']);
+        this.syncSubscriptionFirst().then(() => {
+          this.startHeartbeat();
+          this.startTieredSync();
+          this.pullChanges(['realtime', 'standard', 'lazy']);
+        });
         break;
 
       case 'error': {
@@ -200,8 +202,10 @@ export class CloudSync {
       }
 
       case 'forceSyncNow':
-        this.pullChanges(['realtime', 'standard', 'lazy']);
-        this.pushChanges();
+        this.syncSubscriptionFirst().then(() => {
+          this.pullChanges(['realtime', 'standard', 'lazy']);
+          this.pushChanges();
+        });
         break;
 
       case 'hubRevoked':
@@ -217,9 +221,11 @@ export class CloudSync {
         break;
 
       case 'subscriptionExpired':
-        console.log('[cloud-sync] Subscription expired — enforcing free screen limit');
-        enforceLocalFreeScreenLimit();
-        broadcastToPlayers({ type: 'subscriptionExpired', payload: {} });
+        console.log('[cloud-sync] Subscription expired — re-syncing subscription state');
+        this.syncSubscriptionFirst().then(() => {
+          enforceLocalFreeScreenLimit();
+          broadcastToPlayers({ type: 'subscriptionExpired', payload: {} });
+        });
         break;
 
       default:
@@ -255,8 +261,10 @@ export class CloudSync {
 
   private startTieredSync() {
     this.standardSyncInterval = setInterval(() => {
-      console.log('[cloud-sync] Standard tier sync pull');
-      this.pullChanges(['standard']);
+      console.log('[cloud-sync] Standard tier sync pull (with subscription refresh)');
+      this.syncSubscriptionFirst().then(() => {
+        this.pullChanges(['standard']);
+      });
     }, STANDARD_SYNC_INTERVAL);
 
     this.lazySyncInterval = setInterval(() => {
@@ -398,14 +406,85 @@ export class CloudSync {
     }
   }
 
+  private cachedFeatures: Record<string, boolean> | null = null;
+
+  getCachedFeatures(): Record<string, boolean> | null {
+    return this.cachedFeatures;
+  }
+
+  private async syncSubscriptionFirst(): Promise<void> {
+    try {
+      const httpUrl = this.cloudUrl.replace(/^ws/, 'http');
+      console.log('[cloud-sync] Priority sync: fetching subscription state...');
+      const res = await fetch(`${httpUrl}/api/hub/subscription-state`, {
+        headers: { 'x-hub-token': this.hubToken, 'Accept': 'application/json' },
+      });
+      if (!res.ok) {
+        console.log(`[cloud-sync] Subscription state fetch failed: HTTP ${res.status}`);
+        return;
+      }
+      const state = await res.json() as {
+        subscriber: { id: number; name: string; email: string; plan: string } | null;
+        licenses: any[];
+        subscriptionGroups: any[];
+        features: Record<string, boolean>;
+      };
+
+      const db = getDb();
+      withoutTriggers(() => {
+        if (state.subscriber) {
+          const existing = db.prepare('SELECT id FROM subscribers WHERE id = ?').get(state.subscriber.id);
+          if (existing) {
+            db.prepare('UPDATE subscribers SET plan = ? WHERE id = ?').run(state.subscriber.plan, state.subscriber.id);
+          }
+        }
+
+        if (state.licenses && state.licenses.length > 0) {
+          for (const lic of state.licenses) {
+            if (lic && typeof lic.id !== 'undefined') {
+              upsertRow('licenses', lic);
+            }
+          }
+          console.log(`[cloud-sync] Synced ${state.licenses.length} licenses`);
+        }
+
+        if (state.subscriptionGroups && state.subscriptionGroups.length > 0) {
+          for (const sg of state.subscriptionGroups) {
+            if (sg && typeof sg.id !== 'undefined') {
+              upsertRow('subscription_groups', sg);
+            }
+          }
+          console.log(`[cloud-sync] Synced ${state.subscriptionGroups.length} subscription groups`);
+        }
+      });
+
+      if (state.features) {
+        this.cachedFeatures = state.features;
+        console.log('[cloud-sync] Features resolved from subscription:', Object.entries(state.features).filter(([, v]) => v).map(([k]) => k).join(', '));
+      }
+
+      enforceLocalFreeScreenLimit();
+      console.log('[cloud-sync] Priority subscription sync complete');
+    } catch (e: any) {
+      console.error('[cloud-sync] Subscription sync failed (non-fatal):', e.message);
+      insertErrorLog({
+        level: 'warn',
+        source: 'cloud-sync',
+        message: `Subscription priority sync failed: ${e.message}`,
+      });
+    }
+  }
+
   isConnected(): boolean {
     return !!(this.ws && this.ws.readyState === WebSocket.OPEN && this.isAuthenticated);
   }
 
   triggerForceSync() {
     if (!this.isConnected()) return;
-    this.pullChanges(['realtime', 'standard', 'lazy']);
-    this.pushChanges();
+    this.syncSubscriptionFirst().then(() => {
+      this.pullChanges(['realtime', 'standard', 'lazy']);
+      this.pushChanges();
+    });
   }
 
   sendMessage(message: any): boolean {

@@ -338,8 +338,15 @@ async function pullFullDataViaHubToken(cloudUrl: string, hubToken: string): Prom
     const db = getDb();
     let totalSynced = 0;
 
+    const PRIORITY_KEYS = ['licenses', 'subscriptionGroups'];
+    const sortedEntries = Object.entries(data).sort(([a], [b]) => {
+      const aPri = PRIORITY_KEYS.includes(a) ? 0 : 1;
+      const bPri = PRIORITY_KEYS.includes(b) ? 0 : 1;
+      return aPri - bPri;
+    });
+
     withoutTriggers(() => {
-      for (const [key, rows] of Object.entries(data)) {
+      for (const [key, rows] of sortedEntries) {
         const tableName = FULL_PULL_TABLE_MAP[key] || key;
         if (!Array.isArray(rows)) continue;
         for (const row of rows) {
@@ -1448,22 +1455,57 @@ export async function startServer(port: number): Promise<number> {
   });
 
   app.get('/api/customer/features', requireAuth, (_req: Request, res: Response) => {
+    const cloudFeatures = cloudSync?.getCachedFeatures();
+    if (cloudFeatures) {
+      res.json(cloudFeatures);
+      return;
+    }
+    const db = getDb();
+    const licenses = db.prepare('SELECT plan_tier, status FROM licenses').all() as any[];
+    const activeLicenses = licenses.filter(l => l.status === 'active' || l.status === 'canceling' || l.status === 'trial');
+    if (activeLicenses.length > 0) {
+      const features: Record<string, boolean> = {
+        playlists: true, schedules: false, analytics: false, designStudio: true,
+        smartTriggers: false, aiAnalytics: false, kioskDesigner: false, videoWalls: false,
+        doohAds: false, teamManagement: false, broadcasts: false, knowledgeBase: false,
+        directory: false, screenCast: false, smartQr: false, splitScreen: false,
+        kioskMode: false, remoteControl: false, widgets: false, offlinePlayback: true,
+        remoteView: false, wayfinding: false, wayfinding3d: false,
+        directoryIdleContent: false, emergencyAlerts: false,
+      };
+      const TIER_FEATURES: Record<string, string[]> = {
+        starter: ['schedules', 'analytics', 'splitScreen', 'kioskMode', 'remoteControl', 'widgets'],
+        pro: ['schedules', 'analytics', 'splitScreen', 'kioskMode', 'remoteControl', 'widgets',
+               'smartTriggers', 'kioskDesigner', 'videoWalls', 'teamManagement', 'broadcasts',
+               'screenCast', 'smartQr', 'remoteView'],
+        self_service: ['schedules', 'analytics', 'splitScreen', 'kioskMode', 'remoteControl', 'widgets',
+                        'smartTriggers', 'kioskDesigner', 'videoWalls', 'teamManagement', 'broadcasts',
+                        'screenCast', 'smartQr', 'remoteView'],
+        directory: ['directory', 'directoryIdleContent'],
+        wayfinding_2d: ['directory', 'directoryIdleContent', 'wayfinding'],
+        wayfinding_3d: ['directory', 'directoryIdleContent', 'wayfinding', 'wayfinding3d'],
+        dooh_addon: ['doohAds'],
+      };
+      for (const lic of activeLicenses) {
+        const tier = String(lic.plan_tier || '');
+        const tierFeats = TIER_FEATURES[tier];
+        if (tierFeats) {
+          for (const f of tierFeats) features[f] = true;
+        }
+        if (tier.startsWith('custom_') || tier === 'professional_setup') {
+          Object.keys(features).forEach(k => { features[k] = true; });
+          features.aiAnalytics = false;
+          features.knowledgeBase = false;
+        }
+      }
+      res.json(features);
+      return;
+    }
     res.json({
-      playlists: true,
-      schedules: true,
-      analytics: true,
-      designStudio: true,
-      smartTriggers: true,
-      aiAnalytics: false,
-      kioskDesigner: true,
-      videoWalls: true,
-      doohAds: false,
-      teamManagement: true,
-      broadcasts: true,
-      knowledgeBase: false,
-      directory: false,
-      screenCast: true,
-      smartQr: true,
+      playlists: true, schedules: true, analytics: true, designStudio: true,
+      smartTriggers: true, aiAnalytics: false, kioskDesigner: true, videoWalls: true,
+      doohAds: false, teamManagement: true, broadcasts: true, knowledgeBase: false,
+      directory: false, screenCast: true, smartQr: true,
     });
   });
 
