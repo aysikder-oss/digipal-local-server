@@ -10,7 +10,7 @@ import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPl
 import { startMdns, stopMdns, scanForExistingHubs } from './mdns';
 import { CloudSync } from './cloud-sync';
 import { getConnectedPlayers, registerPlayer, unregisterPlayer, broadcastToPlayers } from './player-bus';
-import { SqliteStorage } from '../db/sqlite-storage';
+import { SqliteStorage, rowsToCamel, rowToCamelExported } from '../db/sqlite-storage';
 import { authenticateUser, getSessionSubscriber, initSessionTable, createSession, getSession, deleteSession, cleanExpiredSessions } from './auth';
 import { saveUploadedFile, getMediaDir, getMediaDiskUsage, deleteLocalFile } from './file-storage';
 import { generateQrSvg, generateQrDataUrl, generateQrBuffer } from './qr-generator';
@@ -261,6 +261,14 @@ const CLOUD_SYNC_ENDPOINTS = [
   { path: '/api/customer/design-templates', table: 'design_templates' },
   { path: '/api/customer/licenses', table: 'licenses' },
   { path: '/api/customer/subscription-groups', table: 'subscription_groups' },
+  { path: '/api/customer/teams', table: 'teams' },
+  { path: '/api/customer/team-members', table: 'team_members' },
+  { path: '/api/customer/team-roles', table: 'team_roles' },
+  { path: '/api/customer/team-screens', table: 'team_screens' },
+  { path: '/api/customer/team-categories', table: 'team_categories' },
+  { path: '/api/customer/notifications', table: 'notifications' },
+  { path: '/api/customer/approvals', table: 'approval_logs' },
+  { path: '/api/customer/widgets', table: 'widget_definitions' },
 ];
 
 async function pullAllDataFromCloud(cloudUrl: string, sessionCookie: string, onStep?: (step: string) => void): Promise<number> {
@@ -1795,6 +1803,87 @@ export async function startServer(port: number): Promise<number> {
     next();
   });
 
+  app.get('/api/qr-codes', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const codes = await storage.getSmartQrCodes(req.session.subscriberId);
+      res.json(codes);
+    } catch (e: any) { res.json([]); }
+  });
+
+  app.get('/api/announcements', requireAuth, async (_req: Request, res: Response) => {
+    res.json([]);
+  });
+
+  app.get('/api/analytics/overview', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const db = getDb();
+      const subscriberId = req.session.subscriberId;
+      const totalScreens = (db.prepare('SELECT COUNT(*) as count FROM screens WHERE owner_id = ?').get(subscriberId) as any)?.count || 0;
+      const onlineScreens = (db.prepare('SELECT COUNT(*) as count FROM screens WHERE owner_id = ? AND is_online = 1').get(subscriberId) as any)?.count || 0;
+      const pairedScreens = (db.prepare('SELECT COUNT(*) as count FROM screens WHERE owner_id = ? AND is_paired = 1').get(subscriberId) as any)?.count || 0;
+
+      const screens = rowsToCamel(db.prepare('SELECT * FROM screens WHERE owner_id = ? ORDER BY name').all(subscriberId) as any[]);
+
+      const allEvents = db.prepare(`
+        SELECT se.*, s.name as screen_name FROM screen_events se
+        LEFT JOIN screens s ON se.screen_id = s.id
+        WHERE s.owner_id = ?
+        ORDER BY se.created_at DESC LIMIT 50
+      `).all(subscriberId) as any[];
+      const recentEvents = allEvents.map((e: any) => {
+        const camel = rowToCamelExported(e);
+        camel.screenName = e.screen_name;
+        return camel;
+      });
+
+      let totalUptimeHours = 0;
+      for (const s of screens) {
+        const analytics = await storage.getScreenAnalytics(s.id);
+        totalUptimeHours += analytics.uptimeHours || 0;
+        (s as any).uptimeHours = analytics.uptimeHours || 0;
+      }
+
+      res.json({
+        totalScreens,
+        onlineScreens,
+        pairedScreens,
+        totalUptimeHours: Math.round(totalUptimeHours),
+        screens,
+        recentEvents,
+      });
+    } catch (e: any) {
+      console.error('[analytics/overview] Error:', e.message);
+      res.json({ totalScreens: 0, onlineScreens: 0, pairedScreens: 0, totalUptimeHours: 0, screens: [], recentEvents: [] });
+    }
+  });
+
+  app.post('/api/uploads/request-url', requireAuth, (req: Request, res: Response) => {
+    const { name, contentType } = req.body;
+    const ext = path.extname(name || '.bin');
+    const uniqueName = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`;
+    const uploadURL = `/api/uploads/direct/${uniqueName}`;
+    const objectPath = `/local-media/uploads/${uniqueName}`;
+    res.json({ uploadURL, objectPath });
+  });
+
+  app.put('/api/uploads/direct/:fileName', requireAuth, (req: Request, res: Response) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      try {
+        const buffer = Buffer.concat(chunks);
+        const { fileName } = saveUploadedFile(buffer, req.params.fileName);
+        res.json({ ok: true, fileName });
+      } catch (e: any) {
+        res.status(500).json({ message: e.message });
+      }
+    });
+  });
+
+  app.post('/api/uploads/confirm', requireAuth, (_req: Request, res: Response) => {
+    res.json({ ok: true });
+  });
+
   app.post('/api/auth/login', async (req: Request, res: Response) => {
     if (hubBlocked) return res.status(503).json({ message: 'Hub is blocked — another Digipal hub was detected on this network. Only one hub is allowed per network.' });
     const { email, password, rememberMe } = req.body;
@@ -3283,19 +3372,19 @@ export async function startServer(port: number): Promise<number> {
 
     if (!activeSchedule) {
       if (screen.playlist_id) {
-        const playlist = db.prepare('SELECT * FROM playlists WHERE id = ?').get(screen.playlist_id);
+        const playlist = rowToCamelExported(db.prepare('SELECT * FROM playlists WHERE id = ?').get(screen.playlist_id));
         return res.json({ playlist, schedule: null });
       }
       if (screen.content_id) {
-        const content = db.prepare('SELECT * FROM contents WHERE id = ?').get(screen.content_id);
+        const content = rowToCamelExported(db.prepare('SELECT * FROM contents WHERE id = ?').get(screen.content_id));
         return res.json({ content, schedule: null });
       }
       return res.json({ playlist: null });
     }
 
-    const playlist = activeSchedule.playlist_id ? db.prepare('SELECT * FROM playlists WHERE id = ?').get(activeSchedule.playlist_id) : null;
-    const content = activeSchedule.content_id ? db.prepare('SELECT * FROM contents WHERE id = ?').get(activeSchedule.content_id) : null;
-    res.json({ playlist, content, schedule: activeSchedule });
+    const playlist = activeSchedule.playlist_id ? rowToCamelExported(db.prepare('SELECT * FROM playlists WHERE id = ?').get(activeSchedule.playlist_id)) : null;
+    const content = activeSchedule.content_id ? rowToCamelExported(db.prepare('SELECT * FROM contents WHERE id = ?').get(activeSchedule.content_id)) : null;
+    res.json({ playlist, content, schedule: rowToCamelExported(activeSchedule) });
   });
 
   app.get('/api/screen/:pairingCode/content', (req: Request, res: Response) => {
@@ -3309,13 +3398,13 @@ export async function startServer(port: number): Promise<number> {
     if (!screen) return res.status(404).json({ message: 'Screen not found' });
 
     if (screen.content_id) {
-      const content = db.prepare('SELECT * FROM contents WHERE id = ?').get(screen.content_id);
+      const content = rowToCamelExported(db.prepare('SELECT * FROM contents WHERE id = ?').get(screen.content_id));
       return res.json({ content });
     }
 
     if (screen.playlist_id) {
-      const playlist = db.prepare('SELECT * FROM playlists WHERE id = ?').get(screen.playlist_id);
-      const items = db.prepare('SELECT pi.*, c.* FROM playlist_items pi JOIN contents c ON pi.content_id = c.id WHERE pi.playlist_id = ? ORDER BY pi.sort_order').all(screen.playlist_id);
+      const playlist = rowToCamelExported(db.prepare('SELECT * FROM playlists WHERE id = ?').get(screen.playlist_id));
+      const items = rowsToCamel(db.prepare('SELECT pi.*, c.* FROM playlist_items pi JOIN contents c ON pi.content_id = c.id WHERE pi.playlist_id = ? ORDER BY pi.sort_order').all(screen.playlist_id) as any[]);
       return res.json({ playlist, items });
     }
 
@@ -3336,7 +3425,7 @@ export async function startServer(port: number): Promise<number> {
       } catch { return true; }
     });
 
-    res.json(applicable);
+    res.json(rowsToCamel(applicable));
   });
 
   app.get('/api/screen/:pairingCode/commands', (req: Request, res: Response) => {
@@ -3344,7 +3433,7 @@ export async function startServer(port: number): Promise<number> {
     const screen = db.prepare('SELECT * FROM screens WHERE pairing_code = ?').get(req.params.pairingCode) as any;
     if (!screen) return res.status(404).json({ message: 'Screen not found' });
 
-    const commands = db.prepare("SELECT * FROM screen_commands WHERE screen_id = ? AND status = 'pending' ORDER BY issued_at ASC").all(screen.id);
+    const commands = rowsToCamel(db.prepare("SELECT * FROM screen_commands WHERE screen_id = ? AND status = 'pending' ORDER BY issued_at ASC").all(screen.id) as any[]);
     res.json(commands);
   });
 
@@ -3425,7 +3514,7 @@ export async function startServer(port: number): Promise<number> {
     if (!screen.kiosk_mode) return res.json({ kiosk: null });
 
     const kiosks = db.prepare('SELECT * FROM kiosks WHERE owner_id = ? OR team_id IN (SELECT team_id FROM team_screens WHERE screen_id = ?)').all(screen.owner_id, screen.id);
-    res.json({ kiosk: kiosks[0] || null, screen });
+    res.json({ kiosk: kiosks[0] ? rowToCamelExported(kiosks[0]) : null, screen: rowToCamelExported(screen) });
   });
 
   app.get('/api/screen/:pairingCode/wall', (req: Request, res: Response) => {
@@ -3434,16 +3523,16 @@ export async function startServer(port: number): Promise<number> {
     if (!screen) return res.status(404).json({ message: 'Screen not found' });
     if (!screen.video_wall_id) return res.json({ wall: null });
 
-    const wall = db.prepare('SELECT * FROM video_walls WHERE id = ?').get(screen.video_wall_id);
-    const wallScreens = db.prepare('SELECT * FROM video_wall_screens WHERE wall_id = ?').all(screen.video_wall_id);
-    res.json({ wall, wallScreens, screen });
+    const wall = rowToCamelExported(db.prepare('SELECT * FROM video_walls WHERE id = ?').get(screen.video_wall_id));
+    const wallScreens = rowsToCamel(db.prepare('SELECT * FROM video_wall_screens WHERE wall_id = ?').all(screen.video_wall_id) as any[]);
+    res.json({ wall, wallScreens, screen: rowToCamelExported(screen) });
   });
 
   app.get('/api/screen/:pairingCode/triggers', (req: Request, res: Response) => {
     const db = getDb();
     const screen = db.prepare('SELECT id FROM screens WHERE pairing_code = ?').get(req.params.pairingCode) as any;
     if (!screen) return res.status(404).json({ message: 'Screen not found' });
-    const triggers = db.prepare('SELECT * FROM smart_triggers WHERE screen_id = ? AND enabled = 1').all(screen.id);
+    const triggers = rowsToCamel(db.prepare('SELECT * FROM smart_triggers WHERE screen_id = ? AND enabled = 1').all(screen.id) as any[]);
     res.json(triggers);
   });
 
