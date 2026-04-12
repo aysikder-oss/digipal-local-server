@@ -1858,7 +1858,7 @@ export async function startServer(port: number): Promise<number> {
   });
 
   app.post('/api/uploads/request-url', requireAuth, (req: Request, res: Response) => {
-    const { name, contentType } = req.body;
+    const { name } = req.body;
     const ext = path.extname(name || '.bin');
     const uniqueName = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`;
     const uploadURL = `/api/uploads/direct/${uniqueName}`;
@@ -1872,8 +1872,11 @@ export async function startServer(port: number): Promise<number> {
     req.on('end', () => {
       try {
         const buffer = Buffer.concat(chunks);
-        const { fileName } = saveUploadedFile(buffer, req.params.fileName);
-        res.json({ ok: true, fileName });
+        const targetName = req.params.fileName;
+        const dir = getMediaDir();
+        const filePath = path.join(dir, 'uploads', targetName);
+        fs.writeFileSync(filePath, buffer);
+        res.json({ ok: true, fileName: targetName });
       } catch (e: any) {
         res.status(500).json({ message: e.message });
       }
