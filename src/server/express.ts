@@ -10,7 +10,7 @@ import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPl
 import { startMdns, stopMdns, scanForExistingHubs } from './mdns';
 import { CloudSync } from './cloud-sync';
 import { getConnectedPlayers, registerPlayer, unregisterPlayer, broadcastToPlayers } from './player-bus';
-import { SqliteStorage, rowsToCamel, rowToCamelExported } from '../db/sqlite-storage';
+import { SqliteStorage, rowsToCamel, rowToCamel } from '../db/sqlite-storage';
 import { authenticateUser, getSessionSubscriber, initSessionTable, createSession, getSession, deleteSession, cleanExpiredSessions } from './auth';
 import { saveUploadedFile, getMediaDir, getMediaDiskUsage, deleteLocalFile } from './file-storage';
 import { generateQrSvg, generateQrDataUrl, generateQrBuffer } from './qr-generator';
@@ -1831,7 +1831,7 @@ export async function startServer(port: number): Promise<number> {
         ORDER BY se.created_at DESC LIMIT 50
       `).all(subscriberId) as any[];
       const recentEvents = allEvents.map((e: any) => {
-        const camel = rowToCamelExported(e);
+        const camel = rowToCamel(e);
         camel.screenName = e.screen_name;
         return camel;
       });
@@ -1870,8 +1870,18 @@ export async function startServer(port: number): Promise<number> {
     res.json({ uploadURL, objectPath });
   });
 
+  const ALLOWED_UPLOAD_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.mp4', '.webm', '.pdf'];
+
   app.put('/api/uploads/direct/:fileName', requireAuth, (req: Request, res: Response) => {
     const MAX_UPLOAD_SIZE = 10 * 1024 * 1024;
+    const targetName = path.basename(req.params.fileName).replace(/[^a-zA-Z0-9._-]/g, '');
+    if (!targetName || targetName.startsWith('.')) {
+      return res.status(400).json({ message: 'Invalid file name' });
+    }
+    const ext = path.extname(targetName).toLowerCase();
+    if (!ALLOWED_UPLOAD_EXTS.includes(ext)) {
+      return res.status(400).json({ message: `File type ${ext} not allowed` });
+    }
     const chunks: Buffer[] = [];
     let totalSize = 0;
     req.on('data', (chunk: Buffer) => {
@@ -1887,10 +1897,6 @@ export async function startServer(port: number): Promise<number> {
       if (res.headersSent) return;
       try {
         const buffer = Buffer.concat(chunks);
-        const targetName = path.basename(req.params.fileName).replace(/[^a-zA-Z0-9._-]/g, '');
-        if (!targetName || targetName.startsWith('.')) {
-          return res.status(400).json({ message: 'Invalid file name' });
-        }
         const dir = getMediaDir();
         const filePath = path.join(dir, 'uploads', targetName);
         fs.writeFileSync(filePath, buffer);
@@ -3393,19 +3399,19 @@ export async function startServer(port: number): Promise<number> {
 
     if (!activeSchedule) {
       if (screen.playlist_id) {
-        const playlist = rowToCamelExported(db.prepare('SELECT * FROM playlists WHERE id = ?').get(screen.playlist_id));
+        const playlist = rowToCamel(db.prepare('SELECT * FROM playlists WHERE id = ?').get(screen.playlist_id));
         return res.json({ playlist, schedule: null });
       }
       if (screen.content_id) {
-        const content = rowToCamelExported(db.prepare('SELECT * FROM contents WHERE id = ?').get(screen.content_id));
+        const content = rowToCamel(db.prepare('SELECT * FROM contents WHERE id = ?').get(screen.content_id));
         return res.json({ content, schedule: null });
       }
       return res.json({ playlist: null });
     }
 
-    const playlist = activeSchedule.playlist_id ? rowToCamelExported(db.prepare('SELECT * FROM playlists WHERE id = ?').get(activeSchedule.playlist_id)) : null;
-    const content = activeSchedule.content_id ? rowToCamelExported(db.prepare('SELECT * FROM contents WHERE id = ?').get(activeSchedule.content_id)) : null;
-    res.json({ playlist, content, schedule: rowToCamelExported(activeSchedule) });
+    const playlist = activeSchedule.playlist_id ? rowToCamel(db.prepare('SELECT * FROM playlists WHERE id = ?').get(activeSchedule.playlist_id)) : null;
+    const content = activeSchedule.content_id ? rowToCamel(db.prepare('SELECT * FROM contents WHERE id = ?').get(activeSchedule.content_id)) : null;
+    res.json({ playlist, content, schedule: rowToCamel(activeSchedule) });
   });
 
   app.get('/api/screen/:pairingCode/content', (req: Request, res: Response) => {
@@ -3419,12 +3425,12 @@ export async function startServer(port: number): Promise<number> {
     if (!screen) return res.status(404).json({ message: 'Screen not found' });
 
     if (screen.content_id) {
-      const content = rowToCamelExported(db.prepare('SELECT * FROM contents WHERE id = ?').get(screen.content_id));
+      const content = rowToCamel(db.prepare('SELECT * FROM contents WHERE id = ?').get(screen.content_id));
       return res.json({ content });
     }
 
     if (screen.playlist_id) {
-      const playlist = rowToCamelExported(db.prepare('SELECT * FROM playlists WHERE id = ?').get(screen.playlist_id));
+      const playlist = rowToCamel(db.prepare('SELECT * FROM playlists WHERE id = ?').get(screen.playlist_id));
       const items = rowsToCamel(db.prepare('SELECT pi.*, c.* FROM playlist_items pi JOIN contents c ON pi.content_id = c.id WHERE pi.playlist_id = ? ORDER BY pi.sort_order').all(screen.playlist_id) as any[]);
       return res.json({ playlist, items });
     }
@@ -3535,7 +3541,7 @@ export async function startServer(port: number): Promise<number> {
     if (!screen.kiosk_mode) return res.json({ kiosk: null });
 
     const kiosks = db.prepare('SELECT * FROM kiosks WHERE owner_id = ? OR team_id IN (SELECT team_id FROM team_screens WHERE screen_id = ?)').all(screen.owner_id, screen.id);
-    res.json({ kiosk: kiosks[0] ? rowToCamelExported(kiosks[0]) : null, screen: rowToCamelExported(screen) });
+    res.json({ kiosk: kiosks[0] ? rowToCamel(kiosks[0]) : null, screen: rowToCamel(screen) });
   });
 
   app.get('/api/screen/:pairingCode/wall', (req: Request, res: Response) => {
@@ -3544,9 +3550,9 @@ export async function startServer(port: number): Promise<number> {
     if (!screen) return res.status(404).json({ message: 'Screen not found' });
     if (!screen.video_wall_id) return res.json({ wall: null });
 
-    const wall = rowToCamelExported(db.prepare('SELECT * FROM video_walls WHERE id = ?').get(screen.video_wall_id));
+    const wall = rowToCamel(db.prepare('SELECT * FROM video_walls WHERE id = ?').get(screen.video_wall_id));
     const wallScreens = rowsToCamel(db.prepare('SELECT * FROM video_wall_screens WHERE wall_id = ?').all(screen.video_wall_id) as any[]);
-    res.json({ wall, wallScreens, screen: rowToCamelExported(screen) });
+    res.json({ wall, wallScreens, screen: rowToCamel(screen) });
   });
 
   app.get('/api/screen/:pairingCode/triggers', (req: Request, res: Response) => {

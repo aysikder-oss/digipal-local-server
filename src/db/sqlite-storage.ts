@@ -404,12 +404,10 @@ function rowToCamel(row: any): any {
   return result;
 }
 
+export { rowToCamel };
+
 export function rowsToCamel(rows: any[]): any[] {
   return rows.map(rowToCamel);
-}
-
-export function rowToCamelExported(row: any): any {
-  return rowToCamel(row);
 }
 
 function buildInsertSql(table: string, data: Record<string, any>): { sql: string; values: any[] } {
