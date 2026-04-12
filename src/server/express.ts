@@ -2006,7 +2006,7 @@ export async function startServer(port: number): Promise<number> {
       lastCloudContact: syncState?.last_cloud_contact_at,
       unpushedChanges: unpushedCount,
       hubName: syncState?.hub_name,
-      version: '1.2.16',
+      version: require('../../package.json').version,
       mode: 'local',
       isLocalServer: true,
       cloudUrl,
