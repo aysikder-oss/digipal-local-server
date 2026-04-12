@@ -1636,8 +1636,17 @@ export async function startServer(port: number): Promise<number> {
 
   app.patch('/api/customer/me', requireAuth, async (req: Request, res: Response) => {
     try {
-      const updated = await storage.updateSubscriber(req.session.subscriberId, req.body);
-      res.json(updated);
+      const allowedFields = ['name', 'firstName', 'lastName', 'avatarUrl', 'phone', 'company', 'timezone', 'language', 'promotionalEmails'];
+      const safeUpdates: Record<string, unknown> = {};
+      for (const key of allowedFields) {
+        if (key in req.body) safeUpdates[key] = req.body[key];
+      }
+      if (Object.keys(safeUpdates).length === 0) {
+        return res.status(400).json({ message: 'No valid fields to update' });
+      }
+      const updated = await storage.updateSubscriber(req.session.subscriberId, safeUpdates);
+      const { passwordHash, ...safe } = updated as any;
+      res.json(safe);
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
