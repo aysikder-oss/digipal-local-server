@@ -1634,6 +1634,13 @@ export async function startServer(port: number): Promise<number> {
     });
   });
 
+  app.patch('/api/customer/me', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const updated = await storage.updateSubscriber(req.session.subscriberId, req.body);
+      res.json(updated);
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
   app.post('/api/customer/accept-terms', requireAuth, async (req: Request, res: Response) => {
     const sub = getSessionSubscriber(req.session.subscriberId);
     if (!sub) return res.status(401).json({ message: 'Session expired' });
