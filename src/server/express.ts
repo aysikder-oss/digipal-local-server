@@ -1107,34 +1107,48 @@ export async function startServer(port: number): Promise<number> {
     res.json([]);
   });
 
+  const LOCAL_PLAN_PRICES: Record<string, number> = {
+    free: 0, starter: 12, pro: 25, custom_signage: 0,
+    self_service: 45, professional_setup: 45, directory: 109,
+    wayfinding_2d: 179, wayfinding_3d: 0, dooh_addon: 50,
+  };
+  const LOCAL_PLAN_FEATURES: Record<string, any> = {
+    free: { playlists: true, schedules: false, videoWalls: false, designStudio: true, analytics: false, teamManagement: false, splitScreen: false, kioskMode: false, remoteControl: false, widgets: false, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: false, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: false, emergencyAlerts: false, knowledgeBase: true, screenCast: false, smartQr: false },
+    starter: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: false, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: false, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: false, emergencyAlerts: false, knowledgeBase: true, screenCast: false, smartQr: false },
+    pro: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: true, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
+    custom_signage: { playlists: true, schedules: true, videoWalls: true, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: true, aiAnalytics: true, kioskDesigner: false, offlinePlayback: true, remoteView: true, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
+    self_service: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: true, aiAnalytics: false, kioskDesigner: true, offlinePlayback: true, remoteView: true, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
+    professional_setup: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: true, aiAnalytics: true, kioskDesigner: true, offlinePlayback: true, remoteView: true, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
+    directory: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: false, teamManagement: false, splitScreen: false, kioskMode: true, remoteControl: true, widgets: false, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: false, doohAds: false, directory: true, wayfinding: false, wayfinding3d: false, directoryIdleContent: true, broadcasts: false, emergencyAlerts: false, knowledgeBase: true, screenCast: false, smartQr: false },
+    wayfinding_2d: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: true, splitScreen: false, kioskMode: true, remoteControl: true, widgets: false, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: false, doohAds: false, directory: true, wayfinding: true, wayfinding3d: false, directoryIdleContent: true, broadcasts: false, emergencyAlerts: false, knowledgeBase: true, screenCast: false, smartQr: false },
+    wayfinding_3d: { playlists: true, schedules: true, videoWalls: true, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: true, aiAnalytics: true, kioskDesigner: true, offlinePlayback: true, remoteView: true, doohAds: false, directory: true, wayfinding: true, wayfinding3d: true, directoryIdleContent: true, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
+    dooh_addon: { playlists: false, schedules: false, videoWalls: false, designStudio: false, analytics: false, teamManagement: false, splitScreen: false, kioskMode: false, remoteControl: false, widgets: false, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: false, remoteView: false, doohAds: true, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: false, emergencyAlerts: false, knowledgeBase: false, screenCast: false, smartQr: false },
+  };
+  const LOCAL_PLAN_CONFIGS = [
+    { tier: 'free', name: 'Free', price: 0 },
+    { tier: 'starter', name: 'Starter', price: 12 },
+    { tier: 'pro', name: 'Pro', price: 25 },
+    { tier: 'custom_signage', name: 'Custom', price: 0 },
+    { tier: 'self_service', name: 'Self-Service', price: 45 },
+    { tier: 'professional_setup', name: 'Professional Setup', price: 45 },
+    { tier: 'directory', name: 'Directory', price: 109 },
+    { tier: 'wayfinding_2d', name: '2D Wayfinding', price: 179 },
+    { tier: 'wayfinding_3d', name: '3D & Custom', price: 0 },
+    { tier: 'dooh_addon', name: 'DOOH Ad Management', price: 50 },
+  ];
+  const LICENSE_PLAN_RANK: Record<string, number> = {
+    free: 0, starter: 1, pro: 2, custom_signage: 3,
+    self_service: 4, professional_setup: 5, directory: 6,
+    wayfinding_2d: 7, wayfinding_3d: 8, dooh_addon: 9,
+  };
+
   app.get('/api/customer/subscription', requireAuth, async (req: Request, res: Response) => {
     try {
       const subscriberId = req.session.subscriberId;
       const sub = getSessionSubscriber(subscriberId);
 
-      const PLAN_PRICES: Record<string, number> = {
-        free: 0, starter: 12, pro: 25, custom_signage: 0,
-        self_service: 45, professional_setup: 45, directory: 109,
-        wayfinding_2d: 179, wayfinding_3d: 0, dooh_addon: 50,
-      };
-      const PLAN_FEATURES: Record<string, any> = {
-        free: { playlists: true, schedules: false, videoWalls: false, designStudio: true, analytics: false, teamManagement: false, splitScreen: false, kioskMode: false, remoteControl: false, widgets: false, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: false, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: false, emergencyAlerts: false, knowledgeBase: true, screenCast: false, smartQr: false },
-        starter: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: false, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: false, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: false, emergencyAlerts: false, knowledgeBase: true, screenCast: false, smartQr: false },
-        pro: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: true, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
-        custom_signage: { playlists: true, schedules: true, videoWalls: true, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: true, aiAnalytics: true, kioskDesigner: false, offlinePlayback: true, remoteView: true, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
-        self_service: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: true, aiAnalytics: false, kioskDesigner: true, offlinePlayback: true, remoteView: true, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
-        professional_setup: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: true, aiAnalytics: true, kioskDesigner: true, offlinePlayback: true, remoteView: true, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
-        directory: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: false, teamManagement: false, splitScreen: false, kioskMode: true, remoteControl: true, widgets: false, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: false, doohAds: false, directory: true, wayfinding: false, wayfinding3d: false, directoryIdleContent: true, broadcasts: false, emergencyAlerts: false, knowledgeBase: true, screenCast: false, smartQr: false },
-        wayfinding_2d: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: true, splitScreen: false, kioskMode: true, remoteControl: true, widgets: false, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: false, doohAds: false, directory: true, wayfinding: true, wayfinding3d: false, directoryIdleContent: true, broadcasts: false, emergencyAlerts: false, knowledgeBase: true, screenCast: false, smartQr: false },
-        wayfinding_3d: { playlists: true, schedules: true, videoWalls: true, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: true, aiAnalytics: true, kioskDesigner: true, offlinePlayback: true, remoteView: true, doohAds: false, directory: true, wayfinding: true, wayfinding3d: true, directoryIdleContent: true, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
-        dooh_addon: { playlists: false, schedules: false, videoWalls: false, designStudio: false, analytics: false, teamManagement: false, splitScreen: false, kioskMode: false, remoteControl: false, widgets: false, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: false, remoteView: false, doohAds: true, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: false, emergencyAlerts: false, knowledgeBase: false, screenCast: false, smartQr: false },
-      };
-
-      const LICENSE_PLAN_RANK: Record<string, number> = {
-        free: 0, starter: 1, pro: 2, custom_signage: 3,
-        self_service: 4, professional_setup: 5, directory: 6,
-        wayfinding_2d: 7, wayfinding_3d: 8, dooh_addon: 9,
-      };
+      const PLAN_PRICES = LOCAL_PLAN_PRICES;
+      const PLAN_FEATURES = LOCAL_PLAN_FEATURES;
 
       function isLicActive(lic: any): boolean {
         return lic && (lic.status === 'active' || lic.status === 'canceling' || lic.status === 'trial');
@@ -1159,6 +1173,38 @@ export async function startServer(port: number): Promise<number> {
       const customerPlaylists = await storage.getPlaylistsByOwner(subscriberId);
       const customerVideoWalls = await storage.getVideoWallsByOwner(subscriberId);
 
+      const customPlanPrices: Record<string, number> = {};
+      const customPlanNames: Record<string, string> = {};
+      const customPlanFeatures: Record<string, any> = {};
+      try {
+        const db = getDb();
+        const cpExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='custom_plans'").get();
+        if (cpExists) {
+          const customPlans = db.prepare('SELECT * FROM custom_plans WHERE subscriber_id = ?').all(subscriberId);
+          for (const cp of customPlans as any[]) {
+            const tier = `custom_${cp.id}`;
+            customPlanPrices[tier] = cp.price || 0;
+            customPlanNames[tier] = cp.name || tier;
+            if (cp.features) {
+              try { customPlanFeatures[tier] = JSON.parse(cp.features); } catch { customPlanFeatures[tier] = PLAN_FEATURES.custom_signage; }
+            } else {
+              customPlanFeatures[tier] = PLAN_FEATURES.custom_signage;
+            }
+          }
+        }
+      } catch {}
+
+      function resolvePrice(tier: string): number {
+        if (PLAN_PRICES[tier] !== undefined) return PLAN_PRICES[tier];
+        if (customPlanPrices[tier] !== undefined) return customPlanPrices[tier];
+        return 0;
+      }
+      function resolveFeatures(tier: string): any {
+        if (PLAN_FEATURES[tier]) return PLAN_FEATURES[tier];
+        if (customPlanFeatures[tier]) return customPlanFeatures[tier];
+        return PLAN_FEATURES.custom_signage;
+      }
+
       const deviceBreakdown: Record<string, number> = { free: 0, starter: 0, pro: 0, custom_signage: 0, self_service: 0, professional_setup: 0, directory: 0, wayfinding_2d: 0, wayfinding_3d: 0, dooh_addon: 0, custom: 0 };
       const paidBreakdown: Record<string, number> = { free: 0, starter: 0, pro: 0, custom_signage: 0, self_service: 0, professional_setup: 0, directory: 0, wayfinding_2d: 0, wayfinding_3d: 0, dooh_addon: 0, custom: 0 };
       let totalMonthly = 0;
@@ -1167,7 +1213,7 @@ export async function startServer(port: number): Promise<number> {
         if (isLicActive(lic)) {
           const tier = lic.planTier || 'free';
           const isAdminFree = lic.adminGranted && !lic.stripeSubscriptionId;
-          const price = (lic.status === 'trial' || isAdminFree) ? 0 : (PLAN_PRICES[tier] || 0);
+          const price = (lic.status === 'trial' || isAdminFree) ? 0 : resolvePrice(tier);
           const interval = lic.billingInterval || 'monthly';
           if (tier.startsWith('custom_')) {
             paidBreakdown.custom = (paidBreakdown.custom || 0) + 1;
@@ -1191,8 +1237,9 @@ export async function startServer(port: number): Promise<number> {
           id: s.id,
           name: s.name,
           plan: planTier,
-          price: PLAN_PRICES[effectivePlan] || 0,
-          features: PLAN_FEATURES[effectivePlan] || PLAN_FEATURES.free,
+          planName: isCustom ? (customPlanNames[effectivePlan] || 'Custom') : undefined,
+          price: resolvePrice(effectivePlan),
+          features: resolveFeatures(effectivePlan),
           isOnline: s.isOnline ?? false,
           licenseId: screenLicense?.id || null,
           licenseStatus: screenLicense?.status || null,
@@ -1300,37 +1347,13 @@ export async function startServer(port: number): Promise<number> {
   });
 
   app.get('/api/plan-configurations', (_req: Request, res: Response) => {
-    const PLAN_CONFIGS = [
-      { tier: 'free', name: 'Free', price: 0 },
-      { tier: 'starter', name: 'Starter', price: 12 },
-      { tier: 'pro', name: 'Pro', price: 25 },
-      { tier: 'custom_signage', name: 'Custom', price: 0 },
-      { tier: 'self_service', name: 'Self-Service', price: 45 },
-      { tier: 'professional_setup', name: 'Professional Setup', price: 45 },
-      { tier: 'directory', name: 'Directory', price: 109 },
-      { tier: 'wayfinding_2d', name: '2D Wayfinding', price: 179 },
-      { tier: 'wayfinding_3d', name: '3D & Custom', price: 0 },
-      { tier: 'dooh_addon', name: 'DOOH Ad Management', price: 50 },
-    ];
-    const PLAN_FEATURES: Record<string, any> = {
-      free: { playlists: true, schedules: false, videoWalls: false, designStudio: true, analytics: false, teamManagement: false, splitScreen: false, kioskMode: false, remoteControl: false, widgets: false, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: false, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: false, emergencyAlerts: false, knowledgeBase: true, screenCast: false, smartQr: false },
-      starter: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: false, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: false, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: false, emergencyAlerts: false, knowledgeBase: true, screenCast: false, smartQr: false },
-      pro: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: true, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
-      custom_signage: { playlists: true, schedules: true, videoWalls: true, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: true, aiAnalytics: true, kioskDesigner: false, offlinePlayback: true, remoteView: true, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
-      self_service: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: true, aiAnalytics: false, kioskDesigner: true, offlinePlayback: true, remoteView: true, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
-      professional_setup: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: true, aiAnalytics: true, kioskDesigner: true, offlinePlayback: true, remoteView: true, doohAds: false, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
-      directory: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: false, teamManagement: false, splitScreen: false, kioskMode: true, remoteControl: true, widgets: false, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: false, doohAds: false, directory: true, wayfinding: false, wayfinding3d: false, directoryIdleContent: true, broadcasts: false, emergencyAlerts: false, knowledgeBase: true, screenCast: false, smartQr: false },
-      wayfinding_2d: { playlists: true, schedules: true, videoWalls: false, designStudio: true, analytics: true, teamManagement: true, splitScreen: false, kioskMode: true, remoteControl: true, widgets: false, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: true, remoteView: false, doohAds: false, directory: true, wayfinding: true, wayfinding3d: false, directoryIdleContent: true, broadcasts: false, emergencyAlerts: false, knowledgeBase: true, screenCast: false, smartQr: false },
-      wayfinding_3d: { playlists: true, schedules: true, videoWalls: true, designStudio: true, analytics: true, teamManagement: true, splitScreen: true, kioskMode: true, remoteControl: true, widgets: true, smartTriggers: true, aiAnalytics: true, kioskDesigner: true, offlinePlayback: true, remoteView: true, doohAds: false, directory: true, wayfinding: true, wayfinding3d: true, directoryIdleContent: true, broadcasts: true, emergencyAlerts: true, knowledgeBase: true, screenCast: true, smartQr: true },
-      dooh_addon: { playlists: false, schedules: false, videoWalls: false, designStudio: false, analytics: false, teamManagement: false, splitScreen: false, kioskMode: false, remoteControl: false, widgets: false, smartTriggers: false, aiAnalytics: false, kioskDesigner: false, offlinePlayback: false, remoteView: false, doohAds: true, directory: false, wayfinding: false, wayfinding3d: false, directoryIdleContent: false, broadcasts: false, emergencyAlerts: false, knowledgeBase: false, screenCast: false, smartQr: false },
-    };
     res.json({
-      plans: PLAN_CONFIGS.map(c => ({
+      plans: LOCAL_PLAN_CONFIGS.map(c => ({
         id: null,
         tier: c.tier,
         name: c.name,
         price: c.price,
-        features: PLAN_FEATURES[c.tier] || PLAN_FEATURES.free,
+        features: LOCAL_PLAN_FEATURES[c.tier] || LOCAL_PLAN_FEATURES.free,
       })),
       hiddenFeatures: [],
     });
