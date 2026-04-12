@@ -269,6 +269,9 @@ const CLOUD_SYNC_ENDPOINTS = [
   { path: '/api/customer/notifications', table: 'notifications' },
   { path: '/api/customer/approvals', table: 'approval_logs' },
   { path: '/api/customer/widgets', table: 'widget_definitions' },
+  { path: '/api/customer/layout-templates', table: 'layout_templates' },
+  { path: '/api/customer/template-categories', table: 'template_categories' },
+  { path: '/api/customer/emergency-alerts/custom-feeds', table: 'custom_alert_feeds' },
 ];
 
 async function pullAllDataFromCloud(cloudUrl: string, sessionCookie: string, onStep?: (step: string) => void): Promise<number> {
@@ -323,14 +326,30 @@ const FULL_PULL_TABLE_MAP: Record<string, string> = {
   schedules: 'schedules',
   playlistItems: 'playlist_items',
   videoWalls: 'video_walls',
+  videoWallScreens: 'video_wall_screens',
   kiosks: 'kiosks',
   broadcasts: 'broadcasts',
   smartQrCodes: 'smart_qr_codes',
   smartTriggers: 'smart_triggers',
   screenGroups: 'screen_groups',
+  screenGroupMembers: 'screen_group_members',
   designTemplates: 'design_templates',
   licenses: 'licenses',
   subscriptionGroups: 'subscription_groups',
+  teams: 'teams',
+  teamMembers: 'team_members',
+  teamRoles: 'team_roles',
+  teamScreens: 'team_screens',
+  teamCategories: 'team_categories',
+  layoutTemplates: 'layout_templates',
+  templateCategories: 'template_categories',
+  widgetCategories: 'widget_categories',
+  widgetDefinitions: 'widget_definitions',
+  emergencyAlertConfigs: 'emergency_alert_configs',
+  customAlertFeeds: 'custom_alert_feeds',
+  notifications: 'notifications',
+  subscribers: 'subscribers',
+  approvalLogs: 'approval_logs',
 };
 
 async function pullFullDataViaHubToken(cloudUrl: string, hubToken: string): Promise<number> {
@@ -1806,6 +1825,12 @@ export async function startServer(port: number): Promise<number> {
     '/api/customer/subscription-groups': '/api/subscription-groups',
     '/api/customer/onboarding': '/api/onboarding',
     '/api/customer/nav-order': '/api/nav-order',
+    '/api/customer/layout-templates': '/api/layout-templates',
+    '/api/customer/template-categories': '/api/template-categories',
+    '/api/customer/widget-categories': '/api/widget-categories',
+    '/api/customer/playlist-items': '/api/playlist-items',
+    '/api/customer/emergency-alerts': '/api/emergency-alerts',
+    '/api/customer/design-templates': '/api/design-templates',
   };
   app.use((req: Request, _res: Response, next: NextFunction) => {
     for (const [prefix, target] of Object.entries(customerPathMap)) {
@@ -3590,8 +3615,17 @@ export async function startServer(port: number): Promise<number> {
 
   app.patch('/api/subscriber', requireAuth, async (req: Request, res: Response) => {
     try {
-      const sub = await storage.updateSubscriber(req.session.subscriberId, req.body);
-      res.json(sub);
+      const allowedFields = ['name', 'firstName', 'lastName', 'avatarUrl', 'phone', 'company', 'timezone', 'language', 'promotionalEmails'];
+      const safeUpdates: Record<string, unknown> = {};
+      for (const key of allowedFields) {
+        if (key in req.body) safeUpdates[key] = req.body[key];
+      }
+      if (Object.keys(safeUpdates).length === 0) {
+        return res.status(400).json({ message: 'No valid fields to update' });
+      }
+      const sub = await storage.updateSubscriber(req.session.subscriberId, safeUpdates);
+      const { passwordHash, ...safe } = sub as any;
+      res.json(safe);
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
