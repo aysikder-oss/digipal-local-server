@@ -1859,20 +1859,38 @@ export async function startServer(port: number): Promise<number> {
 
   app.post('/api/uploads/request-url', requireAuth, (req: Request, res: Response) => {
     const { name } = req.body;
-    const ext = path.extname(name || '.bin');
+    const ext = path.extname(name || '.bin').toLowerCase();
+    const allowedExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.mp4', '.webm', '.pdf'];
+    if (!allowedExts.includes(ext)) {
+      return res.status(400).json({ message: `File type ${ext} not allowed` });
+    }
     const uniqueName = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`;
     const uploadURL = `/api/uploads/direct/${uniqueName}`;
-    const objectPath = `/local-media/uploads/${uniqueName}`;
+    const objectPath = `/media/${uniqueName}`;
     res.json({ uploadURL, objectPath });
   });
 
   app.put('/api/uploads/direct/:fileName', requireAuth, (req: Request, res: Response) => {
+    const MAX_UPLOAD_SIZE = 10 * 1024 * 1024;
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let totalSize = 0;
+    req.on('data', (chunk: Buffer) => {
+      totalSize += chunk.length;
+      if (totalSize > MAX_UPLOAD_SIZE) {
+        res.status(413).json({ message: 'File too large (max 10MB)' });
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', () => {
+      if (res.headersSent) return;
       try {
         const buffer = Buffer.concat(chunks);
-        const targetName = req.params.fileName;
+        const targetName = path.basename(req.params.fileName).replace(/[^a-zA-Z0-9._-]/g, '');
+        if (!targetName || targetName.startsWith('.')) {
+          return res.status(400).json({ message: 'Invalid file name' });
+        }
         const dir = getMediaDir();
         const filePath = path.join(dir, 'uploads', targetName);
         fs.writeFileSync(filePath, buffer);
