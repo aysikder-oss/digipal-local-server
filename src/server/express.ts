@@ -1831,6 +1831,7 @@ export async function startServer(port: number): Promise<number> {
     '/api/customer/playlist-items': '/api/playlist-items',
     '/api/customer/emergency-alerts': '/api/emergency-alerts',
     '/api/customer/design-templates': '/api/design-templates',
+    '/api/customer/video-wall-screens': '/api/video-wall-screens',
   };
   app.use((req: Request, _res: Response, next: NextFunction) => {
     for (const [prefix, target] of Object.entries(customerPathMap)) {
@@ -2207,6 +2208,61 @@ export async function startServer(port: number): Promise<number> {
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
+  app.post('/api/screens/bulk/command', requireAuth, requirePermission('screens.control'), async (req: Request, res: Response) => {
+    try {
+      const { screenIds, command, payload } = req.body;
+      if (!Array.isArray(screenIds) || !command) return res.status(400).json({ message: 'screenIds and command required' });
+      const results = [];
+      for (const screenId of screenIds) {
+        const screen = await storage.getScreen(screenId);
+        if (!screen) continue;
+        const cmd = await storage.createScreenCommand({ screenId, command, payload: payload || null });
+        if (screen.pairingCode) {
+          const players = getConnectedPlayers();
+          const ws = players.get(screen.pairingCode);
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'command', payload: cmd }));
+          }
+        }
+        results.push(cmd);
+      }
+      res.json({ sent: results.length, commands: results });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.post('/api/screens/:id/command', requireAuth, requirePermission('screens.control'), requireOwnership('screens'), async (req: Request, res: Response) => {
+    try {
+      const { command, payload } = req.body;
+      if (!command) return res.status(400).json({ message: 'Command required' });
+      const cmd = await storage.createScreenCommand({ screenId: Number(req.params.id), command, payload: payload || null });
+      const screen = await storage.getScreen(Number(req.params.id));
+      if (screen?.pairingCode) {
+        const players = getConnectedPlayers();
+        const ws = players.get(screen.pairingCode);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'command', payload: cmd }));
+        }
+      }
+      res.json(cmd);
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.post('/api/screens/:id/snapshot/request', requireAuth, requirePermission('screens.view'), requireOwnership('screens'), async (req: Request, res: Response) => {
+    try {
+      const screen = await storage.getScreen(Number(req.params.id));
+      if (!screen) return res.status(404).json({ message: 'Screen not found' });
+      const cmd = await storage.createScreenCommand({ screenId: screen.id, command: 'screenshot', payload: null });
+      if (screen.pairingCode) {
+        const players = getConnectedPlayers();
+        const ws = players.get(screen.pairingCode);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'command', payload: cmd }));
+        }
+      }
+      res.json({ requested: true, commandId: cmd.id });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
   app.get('/api/screens/:id/snapshot', requireAuth, requirePermission('screens.view'), requireOwnership('screens'), async (req: Request, res: Response) => {
     try {
       const snapshot = await storage.getLatestSnapshot(Number(req.params.id));
@@ -2526,6 +2582,34 @@ export async function startServer(port: number): Promise<number> {
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
+  app.post('/api/schedules/bulk', requireAuth, requirePermission('schedules.create'), async (req: Request, res: Response) => {
+    try {
+      const { screenIds, name, contentId, playlistId, videoWallId, startTime, endTime, daysOfWeek, priority, enabled, repeatMode, startDate, endDate, timezone, intervalValue, intervalUnit, intervalDuration, useDefault } = req.body;
+      if (!Array.isArray(screenIds) || screenIds.length === 0) return res.status(400).json({ message: 'At least one screen is required' });
+      if (!name) return res.status(400).json({ message: 'Name is required' });
+      if (startTime === undefined || endTime === undefined) return res.status(400).json({ message: 'Start and end time required' });
+      if (!contentId && !playlistId && !videoWallId && !useDefault) return res.status(400).json({ message: 'Content, playlist, or video wall required' });
+      const created = [];
+      for (const screenId of screenIds) {
+        const screen = await storage.getScreen(screenId);
+        if (!screen) continue;
+        const schedule = await storage.createSchedule({
+          screenId, name, contentId: contentId || null, playlistId: playlistId || null,
+          videoWallId: videoWallId || null, startTime, endTime,
+          daysOfWeek: daysOfWeek || [0, 1, 2, 3, 4, 5, 6],
+          priority: priority || 0, enabled: enabled !== false,
+          repeatMode: repeatMode || 'weekly', startDate: startDate || null,
+          endDate: endDate || null, timezone: timezone || 'UTC',
+          intervalValue: intervalValue || null, intervalUnit: intervalUnit || null,
+          intervalDuration: intervalDuration || null, useDefault: useDefault || false,
+          ownerId: req.session.subscriberId,
+        });
+        created.push(schedule);
+      }
+      res.json({ created: created.length, schedules: created });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
   app.get('/api/video-walls', requireAuth, requirePermission('screens.view'), validateTeamAccess, async (req: Request, res: Response) => {
     try {
       const teamId = req.query.teamId ? Number(req.query.teamId) : null;
@@ -2569,6 +2653,37 @@ export async function startServer(port: number): Promise<number> {
       await storage.assignScreensToVideoWall(Number(req.params.id), req.body.assignments || []);
       const screens = await storage.getVideoWallScreens(Number(req.params.id));
       res.json(screens);
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.post('/api/video-walls/:id/resync', requireAuth, requirePermission('screens.edit'), requireOwnership('video_walls'), async (req: Request, res: Response) => {
+    try {
+      const wallScreens = await storage.getVideoWallScreens(Number(req.params.id));
+      let synced = 0;
+      for (const ws of wallScreens) {
+        if (ws.pairingCode) {
+          const players = getConnectedPlayers();
+          const conn = players.get(ws.pairingCode);
+          if (conn && conn.readyState === WebSocket.OPEN) {
+            conn.send(JSON.stringify({ type: 'command', payload: { command: 'wall_resync' } }));
+            synced++;
+          }
+        }
+      }
+      res.json({ synced });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.patch('/api/video-wall-screens/:id', requireAuth, requirePermission('screens.edit'), async (req: Request, res: Response) => {
+    try {
+      const db = getDb();
+      const vws = db.prepare('SELECT * FROM video_wall_screens WHERE id = ?').get(Number(req.params.id)) as any;
+      if (!vws) return res.status(404).json({ message: 'Video wall screen not found' });
+      const { syncLocked } = req.body;
+      if (syncLocked === undefined) return res.status(400).json({ message: 'No valid fields to update' });
+      db.prepare('UPDATE video_wall_screens SET sync_locked = ? WHERE id = ?').run(syncLocked ? 1 : 0, Number(req.params.id));
+      const updated = rowToCamel(db.prepare('SELECT * FROM video_wall_screens WHERE id = ?').get(Number(req.params.id)));
+      res.json(updated);
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -2782,6 +2897,34 @@ export async function startServer(port: number): Promise<number> {
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
+  app.post('/api/screen-groups/:id/push', requireAuth, requirePermission('screens.edit'), requireOwnership('screen_groups'), async (req: Request, res: Response) => {
+    try {
+      const { contentId, playlistId } = req.body;
+      const isClear = contentId === null && playlistId === null;
+      if (!contentId && !playlistId && !isClear) return res.status(400).json({ message: 'contentId or playlistId required' });
+      const members = await storage.getScreenGroupMembers(Number(req.params.id));
+      if (members.length === 0) return res.status(400).json({ message: 'No screens in this group' });
+      let updated = 0;
+      for (const member of members) {
+        const screen = await storage.getScreen(member.screenId);
+        if (!screen) continue;
+        await storage.updateScreen(member.screenId, {
+          contentId: isClear ? null : (playlistId ? null : (contentId || null)),
+          playlistId: isClear ? null : (playlistId || null),
+        });
+        if (screen.pairingCode) {
+          const players = getConnectedPlayers();
+          const ws = players.get(screen.pairingCode);
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'refresh', payload: { contentId: contentId || null } }));
+          }
+        }
+        updated++;
+      }
+      res.json({ updated });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
   app.get('/api/teams', requireAuth, requirePermission('teams.view'), async (req: Request, res: Response) => {
     try {
       const teams = await storage.getTeamsByOwner(req.session.subscriberId);
@@ -2839,6 +2982,27 @@ export async function startServer(port: number): Promise<number> {
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
+  app.post('/api/teams/:id/members/invite', requireAuth, requirePermission('teams.manage'), requireOwnership('teams'), async (req: Request, res: Response) => {
+    try {
+      const { email, name, roleId } = req.body;
+      if (!email) return res.status(400).json({ message: 'Email is required' });
+      let subscriber = await storage.getSubscriberByEmail(email);
+      if (!subscriber) {
+        return res.status(400).json({ message: 'User not found. On the local server, users must already exist to be invited to a team.' });
+      }
+      const existingMembers = await storage.getTeamMembers(Number(req.params.id));
+      const alreadyMember = existingMembers.find((m: any) => m.subscriberId === subscriber!.id);
+      if (alreadyMember) return res.status(400).json({ message: 'User is already a member of this team' });
+      const member = await storage.addTeamMember({
+        teamId: Number(req.params.id),
+        subscriberId: subscriber.id,
+        roleId: roleId || null,
+        status: 'active',
+      });
+      res.json(member);
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
   app.patch('/api/team-members/:id', requireAuth, requirePermission('teams.manage'), requireOwnership('team_members'), async (req: Request, res: Response) => {
     try {
       const member = await storage.updateTeamMember(Number(req.params.id), req.body);
@@ -2892,6 +3056,13 @@ export async function startServer(port: number): Promise<number> {
     try {
       const result = await storage.assignScreenToTeam({ teamId: Number(req.params.id), ...req.body });
       res.json(result);
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.patch('/api/team-screens/:id', requireAuth, requirePermission('teams.manage'), requireOwnership('team_screens'), async (req: Request, res: Response) => {
+    try {
+      const updated = await storage.updateTeamScreen(Number(req.params.id), req.body);
+      res.json(updated);
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -3244,6 +3415,41 @@ export async function startServer(port: number): Promise<number> {
     try {
       const config = await storage.upsertEmergencyAlertConfig({ ...req.body, subscriberId: req.session.subscriberId });
       res.json(config);
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.delete('/api/emergency-alerts/config', requireAuth, requirePermission('screens.edit'), async (req: Request, res: Response) => {
+    try {
+      await storage.deleteEmergencyAlertConfig(req.session.subscriberId);
+      res.json({ success: true });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.get('/api/emergency-alerts/custom-feeds', requireAuth, requirePermission('screens.view'), async (req: Request, res: Response) => {
+    try {
+      const feeds = await storage.getCustomAlertFeeds(req.session.subscriberId);
+      res.json(feeds);
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.post('/api/emergency-alerts/custom-feeds', requireAuth, requirePermission('screens.edit'), async (req: Request, res: Response) => {
+    try {
+      const feed = await storage.createCustomAlertFeed({ ...req.body, subscriberId: req.session.subscriberId });
+      res.json(feed);
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.put('/api/emergency-alerts/custom-feeds/:id', requireAuth, requirePermission('screens.edit'), requireOwnership('custom_alert_feeds'), async (req: Request, res: Response) => {
+    try {
+      const feed = await storage.updateCustomAlertFeed(Number(req.params.id), req.body);
+      res.json(feed);
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.delete('/api/emergency-alerts/custom-feeds/:id', requireAuth, requirePermission('screens.edit'), requireOwnership('custom_alert_feeds'), async (req: Request, res: Response) => {
+    try {
+      await storage.deleteCustomAlertFeed(Number(req.params.id));
+      res.json({ ok: true });
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 

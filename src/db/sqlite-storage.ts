@@ -313,7 +313,9 @@ export interface ILocalStorage {
 
   getTeamScreens(teamId: number): Promise<DataRecord[]>;
   assignScreenToTeam(assignment: DataRecord): Promise<DataRecord>;
+  updateTeamScreen(id: number, updates: DataRecord): Promise<DataRecord>;
   removeScreenFromTeam(id: number): Promise<void>;
+  deleteEmergencyAlertConfig(subscriberId: number): Promise<void>;
 }
 
 function parseJsonField(val: any): any {
@@ -1788,7 +1790,17 @@ export class SqliteStorage implements ILocalStorage {
     return rowToCamel(this.db.prepare('SELECT * FROM team_screens WHERE id = ?').get(info.lastInsertRowid));
   }
 
+  async updateTeamScreen(id: number, updates: DataRecord) {
+    const { sql, values } = buildUpdateSql('team_screens', id, updates);
+    this.db.prepare(sql).run(...values);
+    return rowToCamel(this.db.prepare('SELECT * FROM team_screens WHERE id = ?').get(id));
+  }
+
   async removeScreenFromTeam(id: number) {
     this.db.prepare('DELETE FROM team_screens WHERE id = ?').run(id);
+  }
+
+  async deleteEmergencyAlertConfig(subscriberId: number) {
+    this.db.prepare('DELETE FROM emergency_alert_configs WHERE subscriber_id = ?').run(subscriberId);
   }
 }
