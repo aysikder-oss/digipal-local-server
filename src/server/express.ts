@@ -2095,6 +2095,61 @@ export async function startServer(port: number): Promise<number> {
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
+  app.put('/api/screens/bulk-layout', requireAuth, requirePermission('screens.edit'), async (req: Request, res: Response) => {
+    try {
+      const { screenIds, layout, customLayoutConfig, layoutZones } = req.body;
+      if (!screenIds || !Array.isArray(screenIds) || !layout) {
+        return res.status(400).json({ message: 'screenIds and layout are required' });
+      }
+      const results = [];
+      for (const screenId of screenIds) {
+        const existingScreen = await storage.getScreen(screenId);
+        if (!existingScreen) continue;
+        const existingZones = (existingScreen.layoutZones as Array<{ zoneId: string; contentId?: number; playlistId?: number }>) || [];
+        const existingMap = new Map(existingZones.map((z: any) => [z.zoneId, z]));
+        const newZoneList = (layoutZones || []) as Array<{ zoneId: string }>;
+        const mergedZones = newZoneList.map((newZone) => {
+          const existing = existingMap.get(newZone.zoneId);
+          if (existing && (existing.contentId || existing.playlistId)) {
+            return { zoneId: newZone.zoneId, contentId: existing.contentId, playlistId: existing.playlistId };
+          }
+          return { zoneId: newZone.zoneId };
+        });
+        const upd: Record<string, unknown> = { layout, layoutZones: mergedZones };
+        if (customLayoutConfig !== undefined) upd.customLayoutConfig = customLayoutConfig;
+        const updated = await storage.updateScreen(screenId, upd);
+        results.push(updated);
+      }
+      res.json({ updated: results.length, screens: results });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.put('/api/screens/:id', requireAuth, requirePermission('screens.edit'), requireOwnership('screens'), async (req: Request, res: Response) => {
+    try {
+      const { ownerId, ...updates } = req.body;
+      const screen = await storage.updateScreen(Number(req.params.id), updates);
+      res.json(screen);
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
+  app.put('/api/screens/:id/schedules-timezone', requireAuth, requirePermission('screens.edit'), requireOwnership('screens'), async (req: Request, res: Response) => {
+    try {
+      const { timezone } = req.body;
+      if (!timezone || typeof timezone !== 'string') {
+        return res.status(400).json({ message: 'timezone is required' });
+      }
+      const schedules = await storage.getSchedules(Number(req.params.id));
+      let updated = 0;
+      for (const sched of schedules) {
+        if ((sched.timezone || 'UTC') !== timezone) {
+          await storage.updateSchedule(sched.id, { timezone });
+          updated++;
+        }
+      }
+      res.json({ updated });
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
+  });
+
   app.delete('/api/screens/:id', requireAuth, requirePermission('screens.delete'), requireOwnership('screens'), async (req: Request, res: Response) => {
     try {
       await storage.deleteScreen(Number(req.params.id));
@@ -2397,12 +2452,14 @@ export async function startServer(port: number): Promise<number> {
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
-  app.post('/api/playlists/:id/reorder', requireAuth, requirePermission('playlists.edit'), requireOwnership('playlists'), async (req: Request, res: Response) => {
+  const reorderPlaylistHandler = async (req: Request, res: Response) => {
     try {
       await storage.reorderPlaylistItems(Number(req.params.id), req.body.itemIds || []);
       res.json({ ok: true });
     } catch (e: any) { res.status(500).json({ message: e.message }); }
-  });
+  };
+  app.post('/api/playlists/:id/reorder', requireAuth, requirePermission('playlists.edit'), requireOwnership('playlists'), reorderPlaylistHandler);
+  app.put('/api/playlists/:id/reorder', requireAuth, requirePermission('playlists.edit'), requireOwnership('playlists'), reorderPlaylistHandler);
 
   app.get('/api/schedules', requireAuth, requirePermission('schedules.view'), validateTeamAccess, async (req: Request, res: Response) => {
     try {
