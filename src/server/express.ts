@@ -2101,6 +2101,237 @@ export async function startServer(port: number): Promise<number> {
     res.json({ hubs });
   });
 
+  function convertWidgetToEmbedUrl(widgetType: string, url: string): string {
+    if (!url) return '';
+    switch (widgetType) {
+      case 'youtube': {
+        const m = url.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|v\/))([^?&]+)/);
+        return m ? `https://www.youtube.com/embed/${m[1]}?autoplay=1&mute=1&loop=1` : url;
+      }
+      case 'google_sheets':
+        return url.includes('/pubhtml') ? url : url.replace(/\/edit.*$/, '/pubhtml?widget=true&headers=false');
+      case 'google_slides':
+        return url.includes('/embed') ? url : url.replace(/\/edit.*$/, '/embed?start=true&loop=true&delayms=5000');
+      case 'google_calendar':
+        return url.includes('/embed') ? url : url;
+      case 'canva': {
+        let canvaUrl = url;
+        const srcMatch = canvaUrl.match(/src=["']([^"']+)["']/);
+        if (srcMatch) canvaUrl = srcMatch[1];
+        if (canvaUrl.includes('/view?embed') || canvaUrl.includes('/watch?embed') || canvaUrl.includes('/watch')) return canvaUrl;
+        const clean = canvaUrl.replace(/\?.*$/, '').replace(/\/$/, '');
+        return clean.endsWith('/view') ? clean + '?embed' : clean + '/view?embed';
+      }
+      case 'tableau':
+        return url.includes('?') ? url : url + '?:embed=y&:display_count=no&:showVizHome=no';
+      default:
+        return url.startsWith('http') ? url : `https://${url}`;
+    }
+  }
+
+  function transformWidgetForTv(content: any): any {
+    if (!content || content.type !== 'widget') return content;
+    try {
+      let parsed: any;
+      try {
+        parsed = JSON.parse(content.data);
+      } catch {
+        parsed = { widgetType: 'embed', url: content.data };
+      }
+      const wType = parsed.widgetType || 'embed';
+      const url = parsed.url || '';
+      if (['clock', 'weather', 'countdown', 'ticker', 'qr_code', 'rss', 'greeting', 'image_gallery', 'announcements', 'progress_tracker', 'quotes', 'counter', 'tradingview', 'html_widget', 'world_clock', 'live_camera'].includes(wType)) {
+        return content;
+      }
+      const embedUrl = convertWidgetToEmbedUrl(wType, url);
+      if (embedUrl) {
+        return { ...content, type: 'website', data: embedUrl };
+      }
+      return content;
+    } catch {
+      return content;
+    }
+  }
+
+  app.get('/api/screens/tv/:pairingCode', async (req: Request, res: Response) => {
+    try {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.set('Pragma', 'no-cache');
+      res.set('Expires', '0');
+
+      const screen = await storage.getScreenByPairingCode(req.params.pairingCode);
+      if (!screen) return res.status(404).json({ message: 'Not found' });
+
+      const now = new Date();
+      storage.updateScreen(screen.id, { lastPingAt: now, isOnline: true }).catch(() => {});
+
+      const screenTz = (screen as any).timezone || 'UTC';
+      let localNow: Date;
+      try {
+        const localeStr = now.toLocaleString('en-US', { timeZone: screenTz });
+        localNow = new Date(localeStr);
+      } catch {
+        localNow = now;
+      }
+      const dayOfWeek = localNow.getDay();
+      const minuteOfDay = localNow.getHours() * 60 + localNow.getMinutes();
+
+      let content: any = null;
+      let playlist: any = null;
+      let activeSchedule: any = null;
+
+      const schedule = await storage.getActiveSchedule(screen.id, dayOfWeek, minuteOfDay);
+      if (schedule) {
+        activeSchedule = schedule;
+        if ((schedule as any).contentId) {
+          content = await storage.getContent((schedule as any).contentId) || null;
+        } else if ((schedule as any).playlistId) {
+          playlist = await storage.getPlaylistWithItems((schedule as any).playlistId) || null;
+        }
+      }
+
+      let defaultContent: any = null;
+      let defaultPlaylist: any = null;
+      if ((screen as any).playlistId) {
+        defaultPlaylist = await storage.getPlaylistWithItems((screen as any).playlistId) || null;
+      } else if ((screen as any).contentId) {
+        defaultContent = await storage.getContent((screen as any).contentId) || null;
+      }
+
+      if (!content && !playlist) {
+        content = defaultContent;
+        playlist = defaultPlaylist;
+      }
+
+      let allSchedules: any[] = [];
+      try {
+        const screenSchedules = await storage.getSchedules(screen.id);
+        const enabledSchedules = (screenSchedules as any[]).filter((s: any) => s.enabled);
+        allSchedules = await Promise.all(enabledSchedules.map(async (s: any) => {
+          let schedContent = null;
+          let schedPlaylist = null;
+          if (s.contentId) {
+            schedContent = await storage.getContent(s.contentId) || null;
+            if (schedContent) schedContent = transformWidgetForTv(schedContent);
+          } else if (s.playlistId) {
+            schedPlaylist = await storage.getPlaylistWithItems(s.playlistId) || null;
+          }
+          return {
+            id: s.id, name: s.name, contentId: s.contentId, playlistId: s.playlistId,
+            videoWallId: s.videoWallId, startTime: s.startTime, endTime: s.endTime,
+            daysOfWeek: s.daysOfWeek, priority: s.priority, enabled: s.enabled,
+            repeatMode: s.repeatMode, startDate: s.startDate, endDate: s.endDate,
+            timezone: s.timezone, intervalValue: s.intervalValue, intervalUnit: s.intervalUnit,
+            intervalDuration: s.intervalDuration, useDefault: s.useDefault, createdAt: s.createdAt,
+            resolvedContent: schedContent, resolvedPlaylist: schedPlaylist,
+          };
+        }));
+      } catch (e) {
+        console.error('[TV-POLL] Error fetching all schedules:', e);
+      }
+
+      const layoutZones = (screen as any).layoutZones as any[] | null;
+      let zoneContents: any[] | null = null;
+      if ((screen as any).layout && (screen as any).layout !== 'single' && layoutZones && layoutZones.length > 0) {
+        const layoutZoneMap: Record<string, string[]> = {
+          'split-horizontal': ['left', 'right'],
+          'split-vertical': ['top', 'bottom'],
+          'grid-2x2': ['top-left', 'top-right', 'bottom-left', 'bottom-right'],
+          'main-sidebar': ['main', 'sidebar'],
+          'sidebar-main': ['sidebar', 'main'],
+          'triple-columns': ['left', 'center', 'right'],
+          'main-bottom': ['main', 'bottom'],
+        };
+        let validZoneIds: Set<string> | null = null;
+        const customCfg = (screen as any).customLayoutConfig as any;
+        if ((screen as any).layout === 'custom' && customCfg?.zones) {
+          validZoneIds = new Set(customCfg.zones.map((z: any) => z.zoneId));
+        } else if (layoutZoneMap[(screen as any).layout as string]) {
+          validZoneIds = new Set(layoutZoneMap[(screen as any).layout as string]);
+        }
+        const splitZones = validZoneIds
+          ? layoutZones.filter((z: any) => validZoneIds!.has(z.zoneId))
+          : layoutZones;
+        zoneContents = await Promise.all(
+          splitZones.map(async (zone: any) => {
+            let zoneContent = null;
+            let zonePlaylist = null;
+            if (zone.contentId) {
+              zoneContent = await storage.getContent(zone.contentId) || null;
+            } else if (zone.playlistId) {
+              zonePlaylist = await storage.getPlaylistWithItems(zone.playlistId) || null;
+            }
+            return { zoneId: zone.zoneId, content: zoneContent, playlist: zonePlaylist };
+          })
+        );
+      }
+
+      const transformedContent = transformWidgetForTv(content);
+      const transformedZoneContents = zoneContents ? zoneContents.map((z: any) => ({
+        ...z,
+        content: transformWidgetForTv(z.content),
+      })) : null;
+      const transformedDefaultContent = transformWidgetForTv(defaultContent);
+
+      const tvStatusPollInterval = await storage.getSetting('tv_status_poll_interval') || 'off';
+      const serverVersion = require('../../package.json').version;
+
+      res.json({
+        screen,
+        content: transformedContent,
+        playlist,
+        activeSchedule,
+        zoneContents: transformedZoneContents,
+        videoWall: null,
+        pendingCommands: [],
+        serverVersion,
+        serverTime: Date.now(),
+        scheduleActivatedAt: null,
+        scheduleDeactivatesAt: null,
+        allSchedules,
+        defaultContent: transformedDefaultContent,
+        defaultPlaylist,
+        tvStatusPollInterval,
+        emergencyAlertConfig: null,
+      });
+    } catch (err: any) {
+      console.error('[TV-POLL] Error:', err.message);
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.get('/api/tv/version', async (_req: Request, res: Response) => {
+    try {
+      const version = require('../../package.json').version;
+      res.json({ version, serverTime: Date.now() });
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.get('/api/tv/playlists/:id', async (req: Request, res: Response) => {
+    try {
+      const playlist = await storage.getPlaylistWithItems(Number(req.params.id));
+      if (!playlist) return res.status(404).json({ message: 'Playlist not found' });
+      res.json(playlist);
+    } catch (err: any) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  app.post('/api/subscription/sync', requireAuth, async (req: Request, res: Response) => {
+    try {
+      if (!cloudSync) {
+        return res.status(503).json({ message: 'Cloud sync is not connected' });
+      }
+      await cloudSync.syncSubscriptionFirst();
+      res.json({ ok: true });
+    } catch (err: any) {
+      console.error('[subscription-sync] Error:', err.message);
+      res.status(500).json({ message: err.message });
+    }
+  });
+
   app.post('/api/screens/tv/register', async (req: Request, res: Response) => {
     try {
       const db = getDb();
