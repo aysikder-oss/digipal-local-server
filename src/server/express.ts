@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import os from 'os';
 import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount, getUnpushedChanges, getFullRow, markChangesPushed, upsertRow, withoutTriggers, SYNCED_TABLES, insertErrorLog, getRecentErrorLogs, getErrorLogCount, pruneOldErrorLogs } from '../db/sqlite';
-import { startMdns, stopMdns, scanForExistingHubs } from './mdns';
+import { startMdns, stopMdns, scanForExistingHubs, getMdnsStatus } from './mdns';
 import { CloudSync } from './cloud-sync';
 import { getConnectedPlayers, registerPlayer, unregisterPlayer, broadcastToPlayers } from './player-bus';
 import { SqliteStorage, rowsToCamel, rowToCamel } from '../db/sqlite-storage';
@@ -935,6 +935,10 @@ export async function startServer(port: number): Promise<number> {
     next();
   });
 
+  app.get('/api/mdns-status', (_req: Request, res: Response) => {
+    res.json(getMdnsStatus());
+  });
+
   app.get('/api/diagnostics', (_req: Request, res: Response) => {
     try {
       const db = getDb();
@@ -1320,17 +1324,31 @@ export async function startServer(port: number): Promise<number> {
       res.json([]);
       return;
     }
+    const lanAddresses: string[] = [];
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+      for (const iface of interfaces[name] || []) {
+        if (iface.family === 'IPv4' && !iface.internal) {
+          lanAddresses.push(iface.address);
+        }
+      }
+    }
+    const port = parseInt(String(process.env.LOCAL_PORT || 8787));
+
     res.json([{
       id: 0,
       subscriberId: syncState.subscriber_id || 0,
       name: syncState.hub_name || os.hostname(),
-      hubToken: '***',
+      hubToken: syncState.hub_token,
       isOnline: !!(cloudSync?.isConnected()),
       lastSeenAt: syncState.last_cloud_contact_at || null,
       lastSyncAt: syncState.last_sync_at || null,
       connectedScreenCount: 0,
       version: require('../../package.json').version,
       createdAt: null,
+      serverUrl: lanAddresses.length > 0 ? `http://${lanAddresses[0]}:${port}` : `http://localhost:${port}`,
+      lanAddresses,
+      port,
     }]);
   });
 
@@ -2038,6 +2056,17 @@ export async function startServer(port: number): Promise<number> {
     const hubRevoked = isHubRevoked();
     const unpushedCount = getUnpushedChangeCount();
     const cloudUrl = syncState?.cloud_url || process.env.CLOUD_URL || 'https://digipalsignage.com';
+
+    const lanAddresses: string[] = [];
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+      for (const iface of interfaces[name] || []) {
+        if (iface.family === 'IPv4' && !iface.internal) {
+          lanAddresses.push(iface.address);
+        }
+      }
+    }
+
     res.json({
       status: hubBlocked ? 'blocked' : hubRevoked ? 'revoked' : 'running',
       hubBlocked,
@@ -2052,6 +2081,9 @@ export async function startServer(port: number): Promise<number> {
       mode: 'local',
       isLocalServer: true,
       cloudUrl,
+      lanAddresses,
+      serverUrl: lanAddresses.length > 0 ? `http://${lanAddresses[0]}:${process.env.LOCAL_PORT || 8787}` : `http://localhost:${process.env.LOCAL_PORT || 8787}`,
+      port: parseInt(String(process.env.LOCAL_PORT || 8787)),
     });
   });
 
