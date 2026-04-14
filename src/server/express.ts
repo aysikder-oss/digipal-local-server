@@ -20,6 +20,7 @@ let wss: WebSocketServer | null = null;
 let cloudSync: CloudSync | null = null;
 let hubBlocked = false;
 let discoveredHubs: Array<{ name: string; host: string; port: number }> = [];
+let boundPort: number = parseInt(String(process.env.LOCAL_PORT || 8787));
 let sessionCleanupInterval: NodeJS.Timeout | null = null;
 const storage = new SqliteStorage();
 
@@ -1333,8 +1334,6 @@ export async function startServer(port: number): Promise<number> {
         }
       }
     }
-    const port = parseInt(String(process.env.LOCAL_PORT || 8787));
-
     res.json([{
       id: 0,
       subscriberId: syncState.subscriber_id || 0,
@@ -1346,9 +1345,9 @@ export async function startServer(port: number): Promise<number> {
       connectedScreenCount: 0,
       version: require('../../package.json').version,
       createdAt: null,
-      serverUrl: lanAddresses.length > 0 ? `http://${lanAddresses[0]}:${port}` : `http://localhost:${port}`,
+      serverUrl: lanAddresses.length > 0 ? `http://${lanAddresses[0]}:${boundPort}` : `http://localhost:${boundPort}`,
       lanAddresses,
-      port,
+      port: boundPort,
     }]);
   });
 
@@ -2082,9 +2081,13 @@ export async function startServer(port: number): Promise<number> {
       isLocalServer: true,
       cloudUrl,
       lanAddresses,
-      serverUrl: lanAddresses.length > 0 ? `http://${lanAddresses[0]}:${process.env.LOCAL_PORT || 8787}` : `http://localhost:${process.env.LOCAL_PORT || 8787}`,
-      port: parseInt(String(process.env.LOCAL_PORT || 8787)),
+      serverUrl: lanAddresses.length > 0 ? `http://${lanAddresses[0]}:${boundPort}` : `http://localhost:${boundPort}`,
+      port: boundPort,
     });
+  });
+
+  app.get('/api/health', (_req: Request, res: Response) => {
+    res.json({ status: 'ok', timestamp: Date.now() });
   });
 
   app.get('/api/hub/setup-status', async (_req: Request, res: Response) => {
@@ -4000,6 +4003,7 @@ export async function startServer(port: number): Promise<number> {
   return new Promise((resolve, reject) => {
     const onListening = () => {
       const actualPort = (server!.address() as { port: number }).port;
+      boundPort = actualPort;
       console.log(`[digipal-local] Server running on port ${actualPort}`);
 
       const syncState = getSyncState();
