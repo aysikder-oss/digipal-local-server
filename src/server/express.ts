@@ -2129,6 +2129,16 @@ export async function startServer(port: number): Promise<number> {
     }
   }
 
+  function sanitizeContentData(content: any): any {
+    if (!content) return content;
+    if (content.data !== undefined && content.data !== null && typeof content.data !== 'string') {
+      content = { ...content, data: String(content.data) };
+    } else if (content.data === undefined || content.data === null) {
+      content = { ...content, data: '' };
+    }
+    return content;
+  }
+
   function transformWidgetForTv(content: any): any {
     if (!content || content.type !== 'widget') return content;
     try {
@@ -2212,7 +2222,7 @@ export async function startServer(port: number): Promise<number> {
           let schedPlaylist = null;
           if (s.contentId) {
             schedContent = await storage.getContent(s.contentId) || null;
-            if (schedContent) schedContent = transformWidgetForTv(schedContent);
+            if (schedContent) schedContent = sanitizeContentData(transformWidgetForTv(schedContent));
           } else if (s.playlistId) {
             schedPlaylist = await storage.getPlaylistWithItems(s.playlistId) || null;
           }
@@ -2266,12 +2276,12 @@ export async function startServer(port: number): Promise<number> {
         );
       }
 
-      const transformedContent = transformWidgetForTv(content);
+      const transformedContent = sanitizeContentData(transformWidgetForTv(content));
       const transformedZoneContents = zoneContents ? zoneContents.map((z: any) => ({
         ...z,
-        content: transformWidgetForTv(z.content),
+        content: sanitizeContentData(transformWidgetForTv(z.content)),
       })) : null;
-      const transformedDefaultContent = transformWidgetForTv(defaultContent);
+      const transformedDefaultContent = sanitizeContentData(transformWidgetForTv(defaultContent));
 
       const tvStatusPollInterval = await storage.getSetting('tv_status_poll_interval') || 'off';
       const serverVersion = require('../../package.json').version;
