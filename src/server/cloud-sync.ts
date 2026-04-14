@@ -1,4 +1,5 @@
 import WebSocket from 'ws';
+import os from 'os';
 import {
   getDb,
   updateSyncState,
