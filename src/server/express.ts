@@ -2200,12 +2200,10 @@ export async function startServer(port: number): Promise<number> {
         UPDATE screens 
         SET is_paired = 1, 
             owner_id = ?, 
-            subscriber_id = ?,
             name = ?,
-            plan_tier = ?,
-            paired_at = datetime('now')
+            plan = ?
         WHERE id = ?
-      `).run(subscriberId, subscriberId, screenName, devicePlan, screen.id);
+      `).run(subscriberId, screenName, devicePlan, screen.id);
 
       if (devicePlan !== 'free') {
         const subscriberLicenses = await storage.getLicensesBySubscriber(subscriberId);
