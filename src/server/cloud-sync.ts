@@ -85,7 +85,20 @@ export class CloudSync {
     this.ws.on('open', () => {
       didOpen = true;
       console.log('[cloud-sync] Connected to cloud');
-      this.send({ type: 'hubIdentify', payload: { hubToken: this.hubToken } });
+      let identifyIp: string | undefined;
+      try {
+        const ifaces = os.networkInterfaces();
+        for (const name of Object.keys(ifaces)) {
+          for (const iface of ifaces[name] || []) {
+            if (iface.family === 'IPv4' && !iface.internal) {
+              identifyIp = iface.address;
+              break;
+            }
+          }
+          if (identifyIp) break;
+        }
+      } catch {}
+      this.send({ type: 'hubIdentify', payload: { hubToken: this.hubToken, ipAddress: identifyIp } });
 
       if (this.authTimeout) clearTimeout(this.authTimeout);
       this.authTimeout = setTimeout(() => {
