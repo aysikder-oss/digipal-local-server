@@ -94,6 +94,7 @@
   <script>
     const app = document.getElementById('app');
     let serverPort = 8787;
+    let dashboardInterval = null;
 
     async function init() {
       if (window.api) {
@@ -192,19 +193,51 @@
           </div>
           <div class="section">
             <h2><span class="dot green"></span> Server Info</h2>
+            <div class="info-row"><span class="label">Server Address</span><span class="value" style="color:#3b82f6;font-weight:600;">${data.serverUrl || ('http://localhost:' + serverPort)}</span></div>
+            ${data.lanAddresses && data.lanAddresses.length > 1 ? '<div class="info-row"><span class="label">All LAN IPs</span><span class="value">' + data.lanAddresses.map(ip => 'http://' + ip + ':' + serverPort).join(', ') + '</span></div>' : ''}
             <div class="info-row"><span class="label">Port</span><span class="value">${serverPort}</span></div>
             <div class="info-row"><span class="label">Last Cloud Sync</span><span class="value">${data.lastSync || 'Never'}</span></div>
             <div class="info-row"><span class="label">mDNS Service</span><span class="value">_digipal._tcp</span></div>
+            <div class="info-row" id="mdns-status-row"><span class="label">mDNS Status</span><span class="value" id="mdns-status-value">Checking...</span></div>
           </div>
         </div>
       `;
-      setInterval(async () => {
-        try {
-          const res = await fetch('http://localhost:' + serverPort + '/api/status');
-          const d = await res.json();
-          renderDashboard(d);
-        } catch {}
-      }, 30000);
+      fetchMdnsStatus();
+      if (!dashboardInterval) {
+        dashboardInterval = setInterval(async () => {
+          try {
+            const res = await fetch('http://localhost:' + serverPort + '/api/status');
+            const d = await res.json();
+            renderDashboard(d);
+          } catch {}
+        }, 30000);
+      }
+    }
+
+    async function fetchMdnsStatus() {
+      try {
+        const res = await fetch('http://localhost:' + serverPort + '/api/mdns-status');
+        const s = await res.json();
+        const el = document.getElementById('mdns-status-value');
+        if (!el) return;
+        if (!s.advertising) {
+          el.textContent = 'Not advertising' + (s.error ? ' (' + s.error + ')' : '');
+          el.style.color = '#ef4444';
+        } else if (s.selfTestPassed === true) {
+          el.textContent = 'Advertising (verified)';
+          el.style.color = '#22c55e';
+        } else if (s.selfTestPassed === false) {
+          el.textContent = 'Advertising (discovery may be blocked)';
+          el.style.color = '#f59e0b';
+        } else {
+          el.textContent = 'Advertising (verifying...)';
+          el.style.color = '#94a3b8';
+          setTimeout(fetchMdnsStatus, 7000);
+        }
+      } catch {
+        const el = document.getElementById('mdns-status-value');
+        if (el) { el.textContent = 'Unknown'; el.style.color = '#94a3b8'; }
+      }
     }
 
     init();
