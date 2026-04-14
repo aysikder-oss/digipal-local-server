@@ -2143,6 +2143,89 @@ export async function startServer(port: number): Promise<number> {
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
+
+  // Available unpaired screens connected via WebSocket (for auto-discover pairing)
+  app.get('/api/screens/available', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const db = getDb();
+      const players = getConnectedPlayers();
+      const connectedCodes = Array.from(players.keys());
+      
+      if (connectedCodes.length === 0) {
+        return res.json([]);
+      }
+      
+      const placeholders = connectedCodes.map(() => '?').join(',');
+      const unpairedScreens = db.prepare(
+        `SELECT * FROM screens WHERE pairing_code IN (${placeholders}) AND (is_paired = 0 OR is_paired IS NULL)`
+      ).all(...connectedCodes);
+      
+      const result = unpairedScreens.map((s: any) => ({
+        ...rowToCamel(s),
+        isConnected: true,
+        platform: 'unknown',
+      }));
+      
+      res.json(result);
+    } catch (e: any) {
+      console.error('[route] GET /api/screens/available error:', e);
+      res.status(500).json({ message: e.message });
+    }
+  });
+
+  // Customer-style pairing endpoint (matches cloud API path)
+  app.post('/api/customer/screens/pair', requireAuth, requirePermission('screens.pair'), async (req: Request, res: Response) => {
+    try {
+      const db = getDb();
+      const { pairingCode, name, plan } = req.body;
+      
+      if (!pairingCode) {
+        return res.status(400).json({ message: 'Pairing code is required' });
+      }
+      
+      const screen = db.prepare('SELECT * FROM screens WHERE pairing_code = ?').get(pairingCode) as any;
+      if (!screen) {
+        return res.status(404).json({ message: 'Screen not found. Make sure the player is running and showing a pairing code.' });
+      }
+      
+      if (screen.is_paired) {
+        return res.status(400).json({ message: 'This screen is already paired' });
+      }
+      
+      const subscriberId = req.session.subscriberId;
+      const screenName = name || screen.name || 'New TV';
+      const devicePlan = plan || 'free';
+      
+      db.prepare(`
+        UPDATE screens 
+        SET is_paired = 1, 
+            owner_id = ?, 
+            subscriber_id = ?,
+            name = ?,
+            plan_tier = ?,
+            paired_at = datetime('now')
+        WHERE id = ?
+      `).run(subscriberId, subscriberId, screenName, devicePlan, screen.id);
+      
+      const updatedScreen = db.prepare('SELECT * FROM screens WHERE id = ?').get(screen.id) as any;
+      
+      // Notify the connected player via WebSocket
+      const players = getConnectedPlayers();
+      const playerWs = players.get(pairingCode);
+      if (playerWs && playerWs.readyState === 1) {
+        playerWs.send(JSON.stringify({ 
+          type: 'paired', 
+          payload: { screenId: updatedScreen.id, name: screenName }
+        }));
+      }
+      
+      res.json(rowToCamel(updatedScreen));
+    } catch (e: any) {
+      console.error('[route] POST /api/customer/screens/pair error:', e);
+      res.status(500).json({ message: e.message });
+    }
+  });
+
   app.post('/api/screens', requireAuth, requirePermission('screens.pair'), async (req: Request, res: Response) => {
     try {
       const screen = await storage.createScreen({ ...req.body, ownerId: req.session.subscriberId });
