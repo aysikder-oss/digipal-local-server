@@ -1373,10 +1373,34 @@ export async function startServer(port: number): Promise<number> {
 
   app.get('/api/customer/trials/status', requireAuth, async (req: Request, res: Response) => {
     try {
+      const db = getDb();
       const syncState = getSyncState();
       const hubToken = syncState?.hub_token;
       const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
       const cloudSessionCookie = syncState?.cloud_session_cookie;
+
+      const getCachedTrialStatus = (): any => {
+        try {
+          const row = db.prepare("SELECT value FROM settings WHERE key = 'cached_trial_status'").get() as any;
+          if (row) {
+            const cached = JSON.parse(row.value);
+            if (cached.timestamp && Date.now() - cached.timestamp < 30 * 60 * 1000) {
+              return cached.data;
+            }
+          }
+        } catch {}
+        return null;
+      };
+
+      const cacheTrialStatus = (data: any) => {
+        try {
+          db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('cached_trial_status', ?)").run(
+            JSON.stringify({ data, timestamp: Date.now() })
+          );
+        } catch (e: any) {
+          console.warn('[trials] Failed to cache trial status:', e.message);
+        }
+      };
 
       if (hubToken && cloudUrl) {
         try {
@@ -1389,11 +1413,22 @@ export async function startServer(port: number): Promise<number> {
           });
           if (cloudRes.ok) {
             const data = await cloudRes.json();
+            cacheTrialStatus(data);
             return res.json(data);
           }
         } catch (e: any) {
-          console.warn('[trials] Cloud trial status fetch failed:', e.message);
+          console.warn('[trials] Cloud trial status fetch failed, using cache:', e.message);
         }
+
+        const cached = getCachedTrialStatus();
+        if (cached) {
+          return res.json(cached);
+        }
+      }
+
+      const cached = getCachedTrialStatus();
+      if (cached) {
+        return res.json(cached);
       }
 
       res.json({ hasUsedTrial: false, activeTrial: null });
