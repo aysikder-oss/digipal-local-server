@@ -230,6 +230,8 @@ export interface ILocalStorage {
   getLicensesBySubscriber(subscriberId: number): Promise<DataRecord[]>;
   getLicenseByScreenId(screenId: number): Promise<DataRecord | undefined>;
   getAvailableLicenses(subscriberId: number): Promise<DataRecord[]>;
+  getLicense(id: number): Promise<DataRecord | undefined>;
+  assignLicenseToScreen(licenseId: number, screenId: number): Promise<DataRecord>;
   getSubscriptionGroupsBySubscriber(subscriberId: number): Promise<DataRecord[]>;
 
   getDesignTemplates(): Promise<DataRecord[]>;
@@ -1420,6 +1422,15 @@ export class SqliteStorage implements ILocalStorage {
 
   async getLicenseByScreenId(screenId: number) {
     return rowToCamel(this.db.prepare('SELECT * FROM licenses WHERE screen_id = ?').get(screenId));
+  }
+
+  async getLicense(id: number) {
+    return rowToCamel(this.db.prepare('SELECT * FROM licenses WHERE id = ?').get(id));
+  }
+
+  async assignLicenseToScreen(licenseId: number, screenId: number) {
+    this.db.prepare('UPDATE licenses SET screen_id = ? WHERE id = ?').run(screenId, licenseId);
+    return rowToCamel(this.db.prepare('SELECT * FROM licenses WHERE id = ?').get(licenseId))!;
   }
 
   async getAvailableLicenses(subscriberId: number) {

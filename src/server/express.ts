@@ -2174,28 +2174,29 @@ export async function startServer(port: number): Promise<number> {
   });
 
   // Customer-style pairing endpoint (matches cloud API path)
-  app.post('/api/customer/screens/pair', requireAuth, requirePermission('screens.pair'), async (req: Request, res: Response) => {
+  app.post('/api/screens/pair', requireAuth, requirePermission('screens.pair'), async (req: Request, res: Response) => {
     try {
       const db = getDb();
       const { pairingCode, name, plan } = req.body;
-      
+
       if (!pairingCode) {
         return res.status(400).json({ message: 'Pairing code is required' });
       }
-      
-      const screen = db.prepare('SELECT * FROM screens WHERE pairing_code = ?').get(pairingCode) as any;
+
+      const normalizedCode = pairingCode.trim().toUpperCase();
+      const screen = db.prepare('SELECT * FROM screens WHERE pairing_code = ?').get(normalizedCode) as any;
       if (!screen) {
         return res.status(404).json({ message: 'Screen not found. Make sure the player is running and showing a pairing code.' });
       }
-      
+
       if (screen.is_paired) {
         return res.status(400).json({ message: 'This screen is already paired' });
       }
-      
+
       const subscriberId = req.session.subscriberId;
       const screenName = name || screen.name || 'New TV';
       const devicePlan = plan || 'free';
-      
+
       db.prepare(`
         UPDATE screens 
         SET is_paired = 1, 
@@ -2206,25 +2207,72 @@ export async function startServer(port: number): Promise<number> {
             paired_at = datetime('now')
         WHERE id = ?
       `).run(subscriberId, subscriberId, screenName, devicePlan, screen.id);
-      
+
+      if (devicePlan !== 'free') {
+        const subscriberLicenses = await storage.getLicensesBySubscriber(subscriberId);
+        const existingScreenLicense = subscriberLicenses.find((l: any) => l.screenId === screen.id && ['active', 'canceling', 'trial'].includes(l.status));
+        if (!existingScreenLicense) {
+          const availableLicense = subscriberLicenses.find((l: any) => l.planTier === devicePlan && ['active', 'canceling', 'trial'].includes(l.status) && !l.screenId);
+          if (availableLicense) {
+            await storage.assignLicenseToScreen(availableLicense.id, screen.id);
+          }
+        }
+      }
+
       const updatedScreen = db.prepare('SELECT * FROM screens WHERE id = ?').get(screen.id) as any;
-      
-      // Notify the connected player via WebSocket
+
       const players = getConnectedPlayers();
-      const playerWs = players.get(pairingCode);
+      const playerWs = players.get(normalizedCode);
       if (playerWs && playerWs.readyState === 1) {
-        playerWs.send(JSON.stringify({ 
-          type: 'paired', 
+        playerWs.send(JSON.stringify({
+          type: 'paired',
           payload: { screenId: updatedScreen.id, name: screenName }
         }));
       }
-      
+
       res.json(rowToCamel(updatedScreen));
     } catch (e: any) {
-      console.error('[route] POST /api/customer/screens/pair error:', e);
+      console.error('[route] POST /api/screens/pair error:', e);
       res.status(500).json({ message: e.message });
     }
   });
+
+  app.post('/api/licenses/:id/assign', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const license = await storage.getLicense(Number(req.params.id));
+      if (!license || license.subscriberId !== req.session.subscriberId) {
+        return res.status(404).json({ message: 'License not found' });
+      }
+      if (!['active', 'canceling', 'trial'].includes(license.status)) {
+        return res.status(400).json({ message: 'This license is not active.' });
+      }
+      if (license.screenId) {
+        return res.status(400).json({ message: 'This license is already assigned to a screen. Unassign it first.' });
+      }
+
+      const { screenId } = req.body;
+      if (!screenId) {
+        return res.status(400).json({ message: 'Screen ID is required.' });
+      }
+
+      const screen = await storage.getScreen(Number(screenId));
+      if (!screen || screen.ownerId !== req.session.subscriberId) {
+        return res.status(404).json({ message: 'Screen not found' });
+      }
+
+      const existingLicense = await storage.getLicenseByScreenId(screen.id);
+      if (existingLicense) {
+        return res.status(400).json({ message: 'This screen already has an active license. Unassign it first.' });
+      }
+
+      const updated = await storage.assignLicenseToScreen(license.id, screen.id);
+      res.json(updated);
+    } catch (e: any) {
+      console.error('[route] POST /api/licenses/:id/assign error:', e);
+      res.status(500).json({ message: e.message });
+    }
+  });
+
 
   app.post('/api/screens', requireAuth, requirePermission('screens.pair'), async (req: Request, res: Response) => {
     try {
