@@ -2553,28 +2553,68 @@ export async function startServer(port: number): Promise<number> {
       const subscriberId = req.session.subscriberId;
       const devicePlan = plan || 'free';
 
-      if (devicePlan !== 'free' && !useTrial) {
+      let trialLicenseCreated = false;
+      if (devicePlan !== 'free') {
         if (cloudSync) {
           try {
             await cloudSync.syncSubscriptionFirst();
           } catch (e: any) {
-            console.error('[pair] Cloud license verification failed for paid plan:', e.message);
-            return res.status(503).json({ message: 'Unable to verify license with cloud. Please check your internet connection and try again.' });
+            if (!useTrial) {
+              console.error('[pair] Cloud license verification failed for paid plan:', e.message);
+              return res.status(503).json({ message: 'Unable to verify license with cloud. Please check your internet connection and try again.' });
+            }
+            console.warn('[pair] Cloud sync failed for trial pairing:', e.message);
           }
-        } else {
+        } else if (!useTrial) {
           return res.status(503).json({ message: 'Cloud sync is not connected. Cannot verify paid license. Please set up your hub connection first.' });
         }
 
         const freshLicenses = await storage.getLicensesBySubscriber(subscriberId);
         const availableLicense = freshLicenses.find((l: any) => l.planTier === devicePlan && ['active', 'canceling', 'trial'].includes(l.status) && !l.screenId);
-        if (!availableLicense) {
-          return res.status(400).json({ message: `No available ${devicePlan} license found. Please purchase a license first.` });
-        }
-      } else if (devicePlan !== 'free' && useTrial) {
-        if (cloudSync) {
-          try { await cloudSync.syncSubscriptionFirst(); } catch (e: any) {
-            console.warn('[pair] Cloud sync failed for trial pairing, proceeding:', e.message);
+
+        if (!availableLicense && useTrial) {
+          const syncState = getSyncState();
+          const hubToken = syncState?.hub_token;
+          const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
+          const cloudSessionCookie = syncState?.cloud_session_cookie;
+
+          if (!hubToken || !cloudUrl) {
+            return res.status(503).json({ message: 'Cloud connection required to start a trial. Please set up your hub connection first.' });
           }
+
+          try {
+            const trialRes = await fetch(`${cloudUrl}/api/hub/trials/start`, {
+              method: 'POST',
+              headers: {
+                'x-hub-token': hubToken,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                ...(cloudSessionCookie ? { 'Cookie': cloudSessionCookie } : {}),
+              },
+              body: JSON.stringify({ screenId: screen.id, plan: devicePlan }),
+            });
+
+            if (!trialRes.ok) {
+              const errData = await trialRes.json().catch(() => ({}));
+              return res.status(trialRes.status).json({ message: errData.message || 'Trial start failed. You may have already used your free trial.' });
+            }
+
+            if (cloudSync) {
+              try { await cloudSync.syncSubscriptionFirst(); } catch {}
+            }
+
+            const updatedLicenses = await storage.getLicensesBySubscriber(subscriberId);
+            const trialLicense = updatedLicenses.find((l: any) => l.planTier === devicePlan && l.status === 'trial' && !l.screenId);
+            if (!trialLicense) {
+              return res.status(500).json({ message: 'Trial was started but license was not synced. Please try again.' });
+            }
+            trialLicenseCreated = true;
+          } catch (e: any) {
+            console.error('[pair] Trial start failed:', e.message);
+            return res.status(503).json({ message: 'Failed to start trial. Check your internet connection.' });
+          }
+        } else if (!availableLicense) {
+          return res.status(400).json({ message: `No available ${devicePlan} license found. Please purchase a license first.` });
         }
       } else if (cloudSync) {
         try {
