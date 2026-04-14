@@ -1050,6 +1050,13 @@ export async function startServer(port: number): Promise<number> {
           startCloudSyncIfNeeded();
         }
       }
+
+      if (hubAlreadyRegistered && cloudSync) {
+        cloudSync.syncSubscriptionFirst().catch((e: any) => {
+          console.warn('[login] Post-login subscription sync failed:', e.message);
+        });
+      }
+
       res.json({
         ...subscriber,
         syncStatus: hubAlreadyRegistered ? 'complete' : 'not_required',
@@ -1364,8 +1371,77 @@ export async function startServer(port: number): Promise<number> {
     }]);
   });
 
-  app.get('/api/customer/trials/status', requireAuth, (_req: Request, res: Response) => {
-    res.json({ active: false, trialEnd: null, plan: null });
+  app.get('/api/customer/trials/status', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const syncState = getSyncState();
+      const hubToken = syncState?.hub_token;
+      const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
+      const cloudSessionCookie = syncState?.cloud_session_cookie;
+
+      if (hubToken && cloudUrl) {
+        try {
+          const cloudRes = await fetch(`${cloudUrl}/api/hub/trials/status`, {
+            headers: {
+              'x-hub-token': hubToken,
+              'Accept': 'application/json',
+              ...(cloudSessionCookie ? { 'Cookie': cloudSessionCookie } : {}),
+            },
+          });
+          if (cloudRes.ok) {
+            const data = await cloudRes.json();
+            return res.json(data);
+          }
+        } catch (e: any) {
+          console.warn('[trials] Cloud trial status fetch failed:', e.message);
+        }
+      }
+
+      res.json({ hasUsedTrial: false, activeTrial: null });
+    } catch (error: any) {
+      console.error('[trials] Error:', error.message);
+      res.json({ hasUsedTrial: false, activeTrial: null });
+    }
+  });
+
+  app.post('/api/customer/trials/start', requireAuth, async (req: Request, res: Response) => {
+    try {
+      const syncState = getSyncState();
+      const hubToken = syncState?.hub_token;
+      const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
+      const cloudSessionCookie = syncState?.cloud_session_cookie;
+
+      if (!hubToken || !cloudUrl) {
+        return res.status(503).json({ message: 'Cloud connection not set up. Trials require cloud connectivity.' });
+      }
+
+      const { screenId, plan } = req.body;
+      if (!plan) return res.status(400).json({ message: 'Plan is required' });
+
+      const cloudRes = await fetch(`${cloudUrl}/api/hub/trials/start`, {
+        method: 'POST',
+        headers: {
+          'x-hub-token': hubToken,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          ...(cloudSessionCookie ? { 'Cookie': cloudSessionCookie } : {}),
+        },
+        body: JSON.stringify({ screenId, plan }),
+      });
+
+      const data = await cloudRes.json();
+      if (!cloudRes.ok) {
+        return res.status(cloudRes.status).json(data);
+      }
+
+      if (cloudSync) {
+        cloudSync.syncSubscriptionFirst().catch(() => {});
+      }
+
+      res.json(data);
+    } catch (error: any) {
+      console.error('[trials/start] Error:', error.message);
+      res.status(500).json({ message: 'Failed to start trial. Check your internet connection.' });
+    }
   });
 
   app.get('/api/customer/custom-plans', requireAuth, async (req: Request, res: Response) => {
