@@ -2135,15 +2135,6 @@ export async function startServer(port: number): Promise<number> {
     } catch (e: any) { console.error('[route] GET /api/screens error:', e); res.status(500).json({ message: e.message }); }
   });
 
-  app.get('/api/screens/:id', requireAuth, requirePermission('screens.view'), requireOwnership('screens'), async (req: Request, res: Response) => {
-    try {
-      const screen = await storage.getScreen(Number(req.params.id));
-      if (!screen) return res.status(404).json({ message: 'Screen not found' });
-      res.json(screen);
-    } catch (e: any) { res.status(500).json({ message: e.message }); }
-  });
-
-
   // Available unpaired screens connected via WebSocket (for auto-discover pairing)
   app.get('/api/screens/available', requireAuth, async (req: Request, res: Response) => {
     try {
@@ -2171,6 +2162,14 @@ export async function startServer(port: number): Promise<number> {
       console.error('[route] GET /api/screens/available error:', e);
       res.status(500).json({ message: e.message });
     }
+  });
+
+  app.get('/api/screens/:id', requireAuth, requirePermission('screens.view'), requireOwnership('screens'), async (req: Request, res: Response) => {
+    try {
+      const screen = await storage.getScreen(Number(req.params.id));
+      if (!screen) return res.status(404).json({ message: 'Screen not found' });
+      res.json(screen);
+    } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
   // Customer-style pairing endpoint (matches cloud API path)
@@ -2237,7 +2236,7 @@ export async function startServer(port: number): Promise<number> {
     }
   });
 
-  app.post('/api/licenses/:id/assign', requireAuth, async (req: Request, res: Response) => {
+  app.post('/api/licenses/:id/assign', requireAuth, requirePermission('billing.manage'), async (req: Request, res: Response) => {
     try {
       const license = await storage.getLicense(Number(req.params.id));
       if (!license || license.subscriberId !== req.session.subscriberId) {
