@@ -3,14 +3,32 @@ import os from 'os';
 
 let bonjour: Bonjour | null = null;
 let published = false;
-let advertisedPort: number | null = null;
-let advertisedName: string | undefined = undefined;
+
+interface MdnsStatus {
+  advertising: boolean;
+  selfTestPassed: boolean | null;
+  port: number;
+  displayName: string;
+  error: string | null;
+}
+
+let mdnsStatus: MdnsStatus = {
+  advertising: false,
+  selfTestPassed: null,
+  port: 0,
+  displayName: '',
+  error: null,
+};
 
 export interface DiscoveredHub {
   name: string;
   host: string;
   port: number;
   addresses: string[];
+}
+
+export function getMdnsStatus(): MdnsStatus {
+  return { ...mdnsStatus };
 }
 
 export function scanForExistingHubs(timeoutMs = 5000): Promise<DiscoveredHub[]> {
@@ -46,6 +64,45 @@ export function scanForExistingHubs(timeoutMs = 5000): Promise<DiscoveredHub[]> 
   });
 }
 
+function runSelfTest(displayName: string, port: number) {
+  let testBonjour: Bonjour | null = null;
+  try {
+    testBonjour = new Bonjour();
+    const browser = testBonjour.find({ type: 'digipal', protocol: 'tcp' });
+    let found = false;
+
+    browser.on('up', (service: any) => {
+      if (service.port === port && (service.name === displayName || service.txt?.hostname === os.hostname())) {
+        found = true;
+        console.log(`[mdns] Self-test PASSED: found own service "${service.name}" on port ${port}`);
+        mdnsStatus.selfTestPassed = true;
+        try {
+          browser.stop();
+          testBonjour?.destroy();
+          testBonjour = null;
+        } catch { }
+      }
+    });
+
+    setTimeout(() => {
+      if (!found) {
+        console.warn(`[mdns] Self-test FAILED: could not discover own service "${displayName}" on port ${port} within 5s`);
+        console.warn('[mdns] This may indicate mDNS multicast is blocked on this network');
+        mdnsStatus.selfTestPassed = false;
+      }
+      try {
+        browser.stop();
+        testBonjour?.destroy();
+        testBonjour = null;
+      } catch { }
+    }, 5000);
+  } catch (err) {
+    console.error('[mdns] Self-test error:', err);
+    mdnsStatus.selfTestPassed = false;
+    try { testBonjour?.destroy(); } catch { }
+  }
+}
+
 export function startMdns(port: number, hubName?: string) {
   try {
     bonjour = new Bonjour();
@@ -66,10 +123,24 @@ export function startMdns(port: number, hubName?: string) {
     });
 
     published = true;
-    advertisedPort = port;
-    advertisedName = displayName;
+    mdnsStatus = {
+      advertising: true,
+      selfTestPassed: null,
+      port,
+      displayName,
+      error: null,
+    };
     console.log(`[mdns] Advertising _digipal._tcp as "${displayName}" on port ${port}`);
-  } catch (err) {
+
+    setTimeout(() => runSelfTest(displayName, port), 1000);
+  } catch (err: any) {
+    mdnsStatus = {
+      advertising: false,
+      selfTestPassed: false,
+      port,
+      displayName: hubName || `Digipal Hub - ${os.hostname()}`,
+      error: err?.message || String(err),
+    };
     console.error('[mdns] Failed to start mDNS advertisement:', err);
   }
 }
@@ -80,16 +151,13 @@ export function stopMdns() {
     bonjour.destroy();
     bonjour = null;
     published = false;
-    advertisedPort = null;
-    advertisedName = undefined;
+    mdnsStatus = {
+      advertising: false,
+      selfTestPassed: null,
+      port: 0,
+      displayName: '',
+      error: null,
+    };
     console.log('[mdns] Stopped mDNS advertisement');
   }
-}
-
-export function getMdnsStatus() {
-  return {
-    running: published,
-    port: advertisedPort,
-    name: advertisedName || null,
-  };
 }
