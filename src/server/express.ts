@@ -2139,6 +2139,14 @@ export async function startServer(port: number): Promise<number> {
     return content;
   }
 
+  function sanitizePlaylist(playlist: any): any {
+    if (!playlist || !playlist.items) return playlist;
+    return {
+      ...playlist,
+      items: playlist.items.map((item: any) => item?.content ? { ...item, content: sanitizeContentData(item.content) } : item),
+    };
+  }
+
   function transformWidgetForTv(content: any): any {
     if (!content || content.type !== 'widget') return content;
     try {
@@ -2233,7 +2241,7 @@ export async function startServer(port: number): Promise<number> {
             repeatMode: s.repeatMode, startDate: s.startDate, endDate: s.endDate,
             timezone: s.timezone, intervalValue: s.intervalValue, intervalUnit: s.intervalUnit,
             intervalDuration: s.intervalDuration, useDefault: s.useDefault, createdAt: s.createdAt,
-            resolvedContent: schedContent, resolvedPlaylist: schedPlaylist,
+            resolvedContent: schedContent, resolvedPlaylist: sanitizePlaylist(schedPlaylist),
           };
         }));
       } catch (e) {
@@ -2271,7 +2279,7 @@ export async function startServer(port: number): Promise<number> {
             } else if (zone.playlistId) {
               zonePlaylist = await storage.getPlaylistWithItems(zone.playlistId) || null;
             }
-            return { zoneId: zone.zoneId, content: zoneContent, playlist: zonePlaylist };
+            return { zoneId: zone.zoneId, content: zoneContent, playlist: sanitizePlaylist(zonePlaylist) };
           })
         );
       }
@@ -2289,7 +2297,7 @@ export async function startServer(port: number): Promise<number> {
       res.json({
         screen,
         content: transformedContent,
-        playlist,
+        playlist: sanitizePlaylist(playlist),
         activeSchedule,
         zoneContents: transformedZoneContents,
         videoWall: null,
@@ -2300,7 +2308,7 @@ export async function startServer(port: number): Promise<number> {
         scheduleDeactivatesAt: null,
         allSchedules,
         defaultContent: transformedDefaultContent,
-        defaultPlaylist,
+        defaultPlaylist: sanitizePlaylist(defaultPlaylist),
         tvStatusPollInterval,
         emergencyAlertConfig: null,
       });
