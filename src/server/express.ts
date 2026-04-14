@@ -2499,7 +2499,7 @@ export async function startServer(port: number): Promise<number> {
   app.post('/api/screens/pair', requireAuth, requirePermission('screens.pair'), async (req: Request, res: Response) => {
     try {
       const db = getDb();
-      const { pairingCode, name, plan } = req.body;
+      const { pairingCode, name, plan, useTrial } = req.body;
 
       if (!pairingCode) {
         return res.status(400).json({ message: 'Pairing code is required' });
@@ -2518,7 +2518,7 @@ export async function startServer(port: number): Promise<number> {
       const subscriberId = req.session.subscriberId;
       const devicePlan = plan || 'free';
 
-      if (devicePlan !== 'free') {
+      if (devicePlan !== 'free' && !useTrial) {
         if (cloudSync) {
           try {
             await cloudSync.syncSubscriptionFirst();
@@ -2534,6 +2534,12 @@ export async function startServer(port: number): Promise<number> {
         const availableLicense = freshLicenses.find((l: any) => l.planTier === devicePlan && ['active', 'canceling', 'trial'].includes(l.status) && !l.screenId);
         if (!availableLicense) {
           return res.status(400).json({ message: `No available ${devicePlan} license found. Please purchase a license first.` });
+        }
+      } else if (devicePlan !== 'free' && useTrial) {
+        if (cloudSync) {
+          try { await cloudSync.syncSubscriptionFirst(); } catch (e: any) {
+            console.warn('[pair] Cloud sync failed for trial pairing, proceeding:', e.message);
+          }
         }
       } else if (cloudSync) {
         try {
