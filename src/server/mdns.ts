@@ -3,6 +3,8 @@ import os from 'os';
 
 let bonjour: Bonjour | null = null;
 let published = false;
+let advertisedPort: number | null = null;
+let advertisedName: string | undefined = undefined;
 
 export interface DiscoveredHub {
   name: string;
@@ -64,6 +66,8 @@ export function startMdns(port: number, hubName?: string) {
     });
 
     published = true;
+    advertisedPort = port;
+    advertisedName = displayName;
     console.log(`[mdns] Advertising _digipal._tcp as "${displayName}" on port ${port}`);
   } catch (err) {
     console.error('[mdns] Failed to start mDNS advertisement:', err);
@@ -76,6 +80,16 @@ export function stopMdns() {
     bonjour.destroy();
     bonjour = null;
     published = false;
+    advertisedPort = null;
+    advertisedName = undefined;
     console.log('[mdns] Stopped mDNS advertisement');
   }
+}
+
+export function getMdnsStatus() {
+  return {
+    running: published,
+    port: advertisedPort,
+    name: advertisedName || null,
+  };
 }
