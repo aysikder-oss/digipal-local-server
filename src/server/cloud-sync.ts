@@ -238,12 +238,26 @@ export class CloudSync {
       const db = getDb();
       const onlineScreens = (db.prepare('SELECT COUNT(*) as count FROM screens WHERE is_online = 1').get() as any)?.count || 0;
 
+      const os = require('os');
+      const nets = os.networkInterfaces();
+      let ipAddress: string | null = null;
+      for (const iface of Object.values(nets) as any[]) {
+        for (const info of (iface || [])) {
+          if (info.family === 'IPv4' && !info.internal) {
+            ipAddress = info.address;
+            break;
+          }
+        }
+        if (ipAddress) break;
+      }
+
       this.send({
         type: 'hubHeartbeat',
         payload: {
           connectedScreenCount: onlineScreens,
           version: require('../../package.json').version,
           connectionMode: 'LOCAL',
+          ipAddress,
         },
       });
 
