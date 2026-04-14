@@ -2030,7 +2030,7 @@ export async function startServer(port: number): Promise<number> {
   app.post('/api/uploads/request-url', requireAuth, (req: Request, res: Response) => {
     const { name } = req.body;
     const ext = path.extname(name || '.bin').toLowerCase();
-    const allowedExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.mp4', '.webm', '.pdf'];
+    const allowedExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.mp4', '.webm', '.ogg', '.mov', '.avi', '.mkv', '.m4v', '.3gp', '.wmv', '.pdf'];
     if (!allowedExts.includes(ext)) {
       return res.status(400).json({ message: `File type ${ext} not allowed` });
     }
@@ -2040,10 +2040,10 @@ export async function startServer(port: number): Promise<number> {
     res.json({ uploadURL, objectPath });
   });
 
-  const ALLOWED_UPLOAD_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.mp4', '.webm', '.pdf'];
+  const ALLOWED_UPLOAD_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.mp4', '.webm', '.ogg', '.mov', '.avi', '.mkv', '.m4v', '.3gp', '.wmv', '.pdf'];
 
   app.put('/api/uploads/direct/:fileName', requireAuth, (req: Request, res: Response) => {
-    const MAX_UPLOAD_SIZE = 10 * 1024 * 1024;
+    const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;
     const targetName = path.basename(req.params.fileName).replace(/[^a-zA-Z0-9._-]/g, '');
     if (!targetName || targetName.startsWith('.')) {
       return res.status(400).json({ message: 'Invalid file name' });
@@ -2057,7 +2057,7 @@ export async function startServer(port: number): Promise<number> {
     req.on('data', (chunk: Buffer) => {
       totalSize += chunk.length;
       if (totalSize > MAX_UPLOAD_SIZE) {
-        res.status(413).json({ message: 'File too large (max 10MB)' });
+        res.status(413).json({ message: 'File too large (max 50MB)' });
         req.destroy();
         return;
       }
@@ -2531,6 +2531,29 @@ export async function startServer(port: number): Promise<number> {
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
+  app.get('/api/screens/:id/detail', requireAuth, requirePermission('screens.view'), requireOwnership('screens'), async (req: Request, res: Response) => {
+    try {
+      const screen = await storage.getScreen(Number(req.params.id));
+      if (!screen) return res.status(404).json({ message: 'Screen not found' });
+      let content = null;
+      if ((screen as any).contentId) {
+        content = await storage.getContent((screen as any).contentId) || null;
+      }
+      let playlist = null;
+      if ((screen as any).playlistId) {
+        playlist = await storage.getPlaylistWithItems((screen as any).playlistId) || null;
+      }
+      const analytics = await storage.getScreenAnalytics(screen.id);
+      const players = getConnectedPlayers();
+      const isWsOnline = players.has((screen as any).pairingCode);
+      const screenSchedules = await storage.getSchedules(screen.id);
+      res.json({ screen, content, playlist, analytics, isWsConnected: isWsOnline, schedules: screenSchedules });
+    } catch (e: any) {
+      console.error('[route] GET /api/screens/:id/detail error:', e.message);
+      res.status(500).json({ message: 'Failed to fetch screen detail' });
+    }
+  });
+
   app.post('/api/screens/pair', requireAuth, requirePermission('screens.pair'), async (req: Request, res: Response) => {
     try {
       const db = getDb();
@@ -2558,14 +2581,10 @@ export async function startServer(port: number): Promise<number> {
           try {
             await cloudSync.syncSubscriptionFirst();
           } catch (e: any) {
-            if (!useTrial) {
-              console.error('[pair] Cloud license verification failed for paid plan:', e.message);
-              return res.status(503).json({ message: 'Unable to verify license with cloud. Please check your internet connection and try again.' });
-            }
-            console.warn('[pair] Cloud sync failed for trial pairing:', e.message);
+            console.warn('[pair] Cloud license sync failed, falling back to locally cached licenses:', e.message);
           }
-        } else if (!useTrial) {
-          return res.status(503).json({ message: 'Cloud sync is not connected. Cannot verify paid license. Please set up your hub connection first.' });
+        } else {
+          console.warn('[pair] Cloud sync not connected, using locally cached licenses');
         }
 
         const freshLicenses = await storage.getLicensesBySubscriber(subscriberId);

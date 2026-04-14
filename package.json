@@ -1,6 +1,6 @@
 {
   "name": "digipal-local-server",
-  "version": "1.2.33",
+  "version": "1.4.16",
   "description": "Digipal On-Premise Local Server",
   "main": "dist/main/index.js",
   "scripts": {
