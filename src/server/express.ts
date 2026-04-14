@@ -2553,7 +2553,6 @@ export async function startServer(port: number): Promise<number> {
       const subscriberId = req.session.subscriberId;
       const devicePlan = plan || 'free';
 
-      let trialLicenseCreated = false;
       if (devicePlan !== 'free') {
         if (cloudSync) {
           try {
@@ -2591,7 +2590,7 @@ export async function startServer(port: number): Promise<number> {
                 'Accept': 'application/json',
                 ...(cloudSessionCookie ? { 'Cookie': cloudSessionCookie } : {}),
               },
-              body: JSON.stringify({ screenId: screen.id, plan: devicePlan }),
+              body: JSON.stringify({ plan: devicePlan }),
             });
 
             if (!trialRes.ok) {
@@ -2608,7 +2607,6 @@ export async function startServer(port: number): Promise<number> {
             if (!trialLicense) {
               return res.status(500).json({ message: 'Trial was started but license was not synced. Please try again.' });
             }
-            trialLicenseCreated = true;
           } catch (e: any) {
             console.error('[pair] Trial start failed:', e.message);
             return res.status(503).json({ message: 'Failed to start trial. Check your internet connection.' });
