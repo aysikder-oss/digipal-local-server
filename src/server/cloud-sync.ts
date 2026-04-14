@@ -1,5 +1,4 @@
 import WebSocket from 'ws';
-import os from 'os';
 import {
   getDb,
   updateSyncState,
@@ -88,6 +87,7 @@ export class CloudSync {
       console.log('[cloud-sync] Connected to cloud');
       let identifyIp: string | undefined;
       try {
+        const os = require('os');
         const ifaces = os.networkInterfaces();
         for (const name of Object.keys(ifaces)) {
           for (const iface of ifaces[name] || []) {
@@ -181,7 +181,7 @@ export class CloudSync {
           clearTimeout(this.authTimeout);
           this.authTimeout = null;
         }
-        this.syncSubscriptionFirst().then(() => {
+        this.syncSubscriptionFirst().catch(() => {}).then(() => {
           this.startHeartbeat();
           this.startTieredSync();
           this.pullChanges(['realtime', 'standard', 'lazy']);
@@ -216,7 +216,7 @@ export class CloudSync {
       }
 
       case 'forceSyncNow':
-        this.syncSubscriptionFirst().then(() => {
+        this.syncSubscriptionFirst().catch(() => {}).then(() => {
           this.pullChanges(['realtime', 'standard', 'lazy']);
           this.pushChanges();
         });
@@ -236,7 +236,7 @@ export class CloudSync {
 
       case 'subscriptionExpired':
         console.log('[cloud-sync] Subscription expired — re-syncing subscription state');
-        this.syncSubscriptionFirst().then(() => {
+        this.syncSubscriptionFirst().catch(() => {}).then(() => {
           enforceLocalFreeScreenLimit();
           broadcastToPlayers({ type: 'subscriptionExpired', payload: {} });
         });
@@ -252,18 +252,20 @@ export class CloudSync {
       const db = getDb();
       const onlineScreens = (db.prepare('SELECT COUNT(*) as count FROM screens WHERE is_online = 1').get() as any)?.count || 0;
 
-      const os = require('os');
-      const nets = os.networkInterfaces();
-      let ipAddress: string | null = null;
-      for (const iface of Object.values(nets) as any[]) {
-        for (const info of (iface || [])) {
-          if (info.family === 'IPv4' && !info.internal) {
-            ipAddress = info.address;
-            break;
+      let localIp: string | undefined;
+      try {
+        const os = require('os');
+        const ifaces = os.networkInterfaces();
+        for (const name of Object.keys(ifaces)) {
+          for (const iface of ifaces[name] || []) {
+            if (iface.family === 'IPv4' && !iface.internal) {
+              localIp = iface.address;
+              break;
+            }
           }
+          if (localIp) break;
         }
-        if (ipAddress) break;
-      }
+      } catch {}
 
       this.send({
         type: 'hubHeartbeat',
@@ -271,7 +273,7 @@ export class CloudSync {
           connectedScreenCount: onlineScreens,
           version: require('../../package.json').version,
           connectionMode: 'LOCAL',
-          ipAddress,
+          ipAddress: localIp,
         },
       });
 
@@ -290,7 +292,7 @@ export class CloudSync {
   private startTieredSync() {
     this.standardSyncInterval = setInterval(() => {
       console.log('[cloud-sync] Standard tier sync pull (with subscription refresh)');
-      this.syncSubscriptionFirst().then(() => {
+      this.syncSubscriptionFirst().catch(() => {}).then(() => {
         this.pullChanges(['standard']);
       });
     }, STANDARD_SYNC_INTERVAL);
@@ -445,7 +447,7 @@ export class CloudSync {
     return null;
   }
 
-  private async syncSubscriptionFirst(): Promise<void> {
+  async syncSubscriptionFirst(): Promise<void> {
     try {
       const httpUrl = this.cloudUrl.replace(/^ws/, 'http');
       console.log('[cloud-sync] Priority sync: fetching subscription state...');
@@ -453,8 +455,9 @@ export class CloudSync {
         headers: { 'x-hub-token': this.hubToken, 'Accept': 'application/json' },
       });
       if (!res.ok) {
-        console.log(`[cloud-sync] Subscription state fetch failed: HTTP ${res.status}`);
-        return;
+        const msg = `Subscription state fetch failed: HTTP ${res.status}`;
+        console.log(`[cloud-sync] ${msg}`);
+        throw new Error(msg);
       }
       const state = await res.json() as {
         subscriber: { id: number; name: string; email: string; plan: string } | null;
@@ -522,12 +525,13 @@ export class CloudSync {
       enforceLocalFreeScreenLimit();
       console.log('[cloud-sync] Priority subscription sync complete');
     } catch (e: any) {
-      console.error('[cloud-sync] Subscription sync failed (non-fatal):', e.message);
+      console.error('[cloud-sync] Subscription sync failed:', e.message);
       insertErrorLog({
         level: 'warn',
         source: 'cloud-sync',
         message: `Subscription priority sync failed: ${e.message}`,
       });
+      throw e;
     }
   }
 
@@ -537,7 +541,7 @@ export class CloudSync {
 
   triggerForceSync() {
     if (!this.isConnected()) return;
-    this.syncSubscriptionFirst().then(() => {
+    this.syncSubscriptionFirst().catch(() => {}).then(() => {
       this.pullChanges(['realtime', 'standard', 'lazy']);
       this.pushChanges();
     });

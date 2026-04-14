@@ -1338,7 +1338,7 @@ export async function startServer(port: number): Promise<number> {
       id: 0,
       subscriberId: syncState.subscriber_id || 0,
       name: syncState.hub_name || os.hostname(),
-      hubToken: syncState.hub_token,
+      hubToken: '***',
       isOnline: !!(cloudSync?.isConnected()),
       lastSeenAt: syncState.last_cloud_contact_at || null,
       lastSyncAt: syncState.last_sync_at || null,
@@ -2090,6 +2090,17 @@ export async function startServer(port: number): Promise<number> {
     res.json({ status: 'ok', timestamp: Date.now() });
   });
 
+  app.get('/api/hub/setup-status', async (_req: Request, res: Response) => {
+    const syncState = getSyncState();
+    const isSetup = !!(syncState?.hub_token && syncState?.cloud_url);
+    res.json({ isSetup, hubRevoked: isHubRevoked(), hubName: syncState?.hub_name });
+  });
+
+  app.post('/api/hub/scan', async (_req: Request, res: Response) => {
+    const hubs = await scanForExistingHubs(5000);
+    res.json({ hubs });
+  });
+
   app.post('/api/screens/tv/register', async (req: Request, res: Response) => {
     try {
       const db = getDb();
@@ -2116,17 +2127,6 @@ export async function startServer(port: number): Promise<number> {
     }
   });
 
-  app.get('/api/hub/setup-status', async (_req: Request, res: Response) => {
-    const syncState = getSyncState();
-    const isSetup = !!(syncState?.hub_token && syncState?.cloud_url);
-    res.json({ isSetup, hubRevoked: isHubRevoked(), hubName: syncState?.hub_name });
-  });
-
-  app.post('/api/hub/scan', async (_req: Request, res: Response) => {
-    const hubs = await scanForExistingHubs(5000);
-    res.json({ hubs });
-  });
-
   app.get('/api/screens', requireAuth, requirePermission('screens.view'), validateTeamAccess, async (req: Request, res: Response) => {
     try {
       const teamId = req.query.teamId ? Number(req.query.teamId) : null;
@@ -2135,28 +2135,27 @@ export async function startServer(port: number): Promise<number> {
     } catch (e: any) { console.error('[route] GET /api/screens error:', e); res.status(500).json({ message: e.message }); }
   });
 
-  // Available unpaired screens connected via WebSocket (for auto-discover pairing)
   app.get('/api/screens/available', requireAuth, async (req: Request, res: Response) => {
     try {
       const db = getDb();
       const players = getConnectedPlayers();
       const connectedCodes = Array.from(players.keys());
-      
+
       if (connectedCodes.length === 0) {
         return res.json([]);
       }
-      
+
       const placeholders = connectedCodes.map(() => '?').join(',');
       const unpairedScreens = db.prepare(
         `SELECT * FROM screens WHERE pairing_code IN (${placeholders}) AND (is_paired = 0 OR is_paired IS NULL)`
       ).all(...connectedCodes);
-      
+
       const result = unpairedScreens.map((s: any) => ({
         ...rowToCamel(s),
         isConnected: true,
         platform: 'unknown',
       }));
-      
+
       res.json(result);
     } catch (e: any) {
       console.error('[route] GET /api/screens/available error:', e);
@@ -2172,7 +2171,6 @@ export async function startServer(port: number): Promise<number> {
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
-  // Customer-style pairing endpoint (matches cloud API path)
   app.post('/api/screens/pair', requireAuth, requirePermission('screens.pair'), async (req: Request, res: Response) => {
     try {
       const db = getDb();
@@ -2193,8 +2191,38 @@ export async function startServer(port: number): Promise<number> {
       }
 
       const subscriberId = req.session.subscriberId;
-      const screenName = name || screen.name || 'New TV';
       const devicePlan = plan || 'free';
+
+      if (devicePlan !== 'free') {
+        if (cloudSync) {
+          try {
+            await cloudSync.syncSubscriptionFirst();
+          } catch (e: any) {
+            console.error('[pair] Cloud license verification failed for paid plan:', e.message);
+            return res.status(503).json({ message: 'Unable to verify license with cloud. Please check your internet connection and try again.' });
+          }
+        } else {
+          return res.status(503).json({ message: 'Cloud sync is not connected. Cannot verify paid license. Please set up your hub connection first.' });
+        }
+
+        const freshLicenses = await storage.getLicensesBySubscriber(subscriberId);
+        const availableLicense = freshLicenses.find((l: any) => l.planTier === devicePlan && ['active', 'canceling', 'trial'].includes(l.status) && !l.screenId);
+        if (!availableLicense) {
+          return res.status(400).json({ message: `No available ${devicePlan} license found. Please purchase a license first.` });
+        }
+      } else if (cloudSync) {
+        try {
+          await cloudSync.syncSubscriptionFirst();
+        } catch (e: any) {
+          console.warn('[pair] Cloud license sync failed for free plan, proceeding with local data:', e.message);
+        }
+      }
+
+      let screenName = name;
+      if (!screenName || screenName === 'New TV') {
+        const existingCount = (db.prepare('SELECT COUNT(*) as count FROM screens WHERE owner_id = ? AND is_paired = 1').get(subscriberId) as any)?.count || 0;
+        screenName = `Screen ${existingCount + 1}`;
+      }
 
       db.prepare(`
         UPDATE screens 
@@ -2217,19 +2245,42 @@ export async function startServer(port: number): Promise<number> {
       }
 
       const updatedScreen = db.prepare('SELECT * FROM screens WHERE id = ?').get(screen.id) as any;
+      const camelScreen = rowToCamel(updatedScreen);
 
       const players = getConnectedPlayers();
       const playerWs = players.get(normalizedCode);
       if (playerWs && playerWs.readyState === 1) {
+        let playlist = null;
+        if (updatedScreen.playlist_id) {
+          try { playlist = await storage.getPlaylistWithItems(updatedScreen.playlist_id); } catch {}
+        }
+        let schedules: any[] = [];
+        try { schedules = (await storage.getSchedules(updatedScreen.id)) as any[]; } catch {}
+
         playerWs.send(JSON.stringify({
           type: 'paired',
-          payload: { screenId: updatedScreen.id, name: screenName }
+          payload: {
+            screenId: updatedScreen.id,
+            name: screenName,
+            screen: camelScreen,
+            playlist: playlist || null,
+            schedules,
+          }
+        }));
+        playerWs.send(JSON.stringify({
+          type: 'refresh',
+          payload: {
+            screenId: updatedScreen.id,
+            screen: camelScreen,
+            playlist: playlist || null,
+            schedules,
+          }
         }));
       }
 
-      res.json(rowToCamel(updatedScreen));
+      res.json(camelScreen);
     } catch (e: any) {
-      console.error('[route] POST /api/screens/pair error:', e);
+      console.error('[route] POST /api/customer/screens/pair error:', e);
       res.status(500).json({ message: e.message });
     }
   });
@@ -2265,11 +2316,10 @@ export async function startServer(port: number): Promise<number> {
       const updated = await storage.assignLicenseToScreen(license.id, screen.id);
       res.json(updated);
     } catch (e: any) {
-      console.error('[route] POST /api/licenses/:id/assign error:', e);
+      console.error('[route] POST /api/customer/licenses/:id/assign error:', e);
       res.status(500).json({ message: e.message });
     }
   });
-
 
   app.post('/api/screens', requireAuth, requirePermission('screens.pair'), async (req: Request, res: Response) => {
     try {
@@ -2281,6 +2331,30 @@ export async function startServer(port: number): Promise<number> {
   app.patch('/api/screens/:id', requireAuth, requirePermission('screens.edit'), requireOwnership('screens'), async (req: Request, res: Response) => {
     try {
       const screen = await storage.updateScreen(Number(req.params.id), req.body);
+
+      if (screen && (screen as any).pairingCode) {
+        const players = getConnectedPlayers();
+        const ws = players.get((screen as any).pairingCode);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          let playlist = null;
+          if ((screen as any).playlistId) {
+            try { playlist = await storage.getPlaylistWithItems((screen as any).playlistId); } catch {}
+          }
+          let schedules: any[] = [];
+          try { schedules = (await storage.getSchedules(Number(req.params.id))) as any[]; } catch {}
+
+          ws.send(JSON.stringify({
+            type: 'refresh',
+            payload: {
+              screenId: Number(req.params.id),
+              screen,
+              playlist: playlist || null,
+              schedules,
+            }
+          }));
+        }
+      }
+
       res.json(screen);
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
@@ -2318,6 +2392,30 @@ export async function startServer(port: number): Promise<number> {
     try {
       const { ownerId, ...updates } = req.body;
       const screen = await storage.updateScreen(Number(req.params.id), updates);
+
+      if (screen && (screen as any).pairingCode) {
+        const players = getConnectedPlayers();
+        const ws = players.get((screen as any).pairingCode);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          let playlist = null;
+          if ((screen as any).playlistId) {
+            try { playlist = await storage.getPlaylistWithItems((screen as any).playlistId); } catch {}
+          }
+          let schedules: any[] = [];
+          try { schedules = (await storage.getSchedules(Number(req.params.id))) as any[]; } catch {}
+
+          ws.send(JSON.stringify({
+            type: 'refresh',
+            payload: {
+              screenId: Number(req.params.id),
+              screen,
+              playlist: playlist || null,
+              schedules,
+            }
+          }));
+        }
+      }
+
       res.json(screen);
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });

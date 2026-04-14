@@ -14,6 +14,15 @@ export function unregisterPlayer(pairingCode: string) {
   connectedPlayers.delete(pairingCode);
 }
 
+export function sendToPlayer(pairingCode: string, message: any): boolean {
+  const ws = connectedPlayers.get(pairingCode);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(message));
+    return true;
+  }
+  return false;
+}
+
 export function broadcastToPlayers(message: any) {
   const payload = JSON.stringify(message);
   connectedPlayers.forEach((ws) => {
