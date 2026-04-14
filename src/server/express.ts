@@ -2090,6 +2090,32 @@ export async function startServer(port: number): Promise<number> {
     res.json({ status: 'ok', timestamp: Date.now() });
   });
 
+  app.post('/api/screens/tv/register', async (req: Request, res: Response) => {
+    try {
+      const db = getDb();
+      const { existingCode } = req.body || {};
+      if (existingCode) {
+        const existing = db.prepare('SELECT * FROM screens WHERE pairing_code = ?').get(existingCode) as any;
+        if (existing) {
+          return res.json(rowToCamel(existing));
+        }
+      }
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+      let code = '';
+      for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+      while (db.prepare('SELECT id FROM screens WHERE pairing_code = ?').get(code)) {
+        code = '';
+        for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+      }
+      db.prepare('INSERT INTO screens (name, pairing_code, is_paired, is_online) VALUES (?, ?, 0, 0)').run('New TV', code);
+      const newScreen = db.prepare('SELECT * FROM screens WHERE pairing_code = ?').get(code) as any;
+      res.json(rowToCamel(newScreen));
+    } catch (err: any) {
+      console.error('[tv-register] Error:', err.message);
+      res.status(500).json({ message: err.message });
+    }
+  });
+
   app.get('/api/hub/setup-status', async (_req: Request, res: Response) => {
     const syncState = getSyncState();
     const isSetup = !!(syncState?.hub_token && syncState?.cloud_url);
