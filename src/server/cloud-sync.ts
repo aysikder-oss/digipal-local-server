@@ -12,6 +12,7 @@ import {
   setHubRevoked,
   updateCloudContactTime,
   enforceLocalFreeScreenLimit,
+  reconcileScreenLicenseStatuses,
   getUnsentErrorLogs,
   markErrorLogsSent,
   pruneOldErrorLogs,
@@ -237,6 +238,7 @@ export class CloudSync {
       case 'subscriptionExpired':
         console.log('[cloud-sync] Subscription expired — re-syncing subscription state');
         this.syncSubscriptionFirst().catch(() => {}).then(() => {
+          reconcileScreenLicenseStatuses();
           enforceLocalFreeScreenLimit();
           broadcastToPlayers({ type: 'subscriptionExpired', payload: {} });
         });
@@ -427,11 +429,12 @@ export class CloudSync {
       updateSyncState(updates);
     }
 
-    const hasScreenLicenseChanges = changes.some(
-      (c) => c.tableName === 'screens' && (c.data?.license_status || c.payload?.license_status)
+    const hasLicenseRelatedChanges = changes.some(
+      (c) => c.tableName === 'licenses' || (c.tableName === 'screens' && (c.data?.license_status || c.payload?.license_status))
     );
-    if (hasScreenLicenseChanges) {
-      console.log('[cloud-sync] Screen license status changed — enforcing free screen limit');
+    if (hasLicenseRelatedChanges) {
+      console.log('[cloud-sync] License-related changes detected — reconciling and enforcing free screen limit');
+      reconcileScreenLicenseStatuses();
       enforceLocalFreeScreenLimit();
     }
   }
@@ -522,6 +525,7 @@ export class CloudSync {
         console.log('[cloud-sync] Features resolved from subscription:', Object.entries(state.features).filter(([, v]) => v).map(([k]) => k).join(', '));
       }
 
+      reconcileScreenLicenseStatuses();
       enforceLocalFreeScreenLimit();
       console.log('[cloud-sync] Priority subscription sync complete');
     } catch (e: any) {
