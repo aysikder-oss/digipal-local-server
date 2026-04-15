@@ -19,7 +19,7 @@ jobs:
       - name: Install frontend dependencies
         run: cd ../cloud-app && npm install --ignore-scripts
       - name: Build frontend
-        run: cd ../cloud-app && VITE_IS_LOCAL_SERVER=true npx vite build && cp -r dist/public $GITHUB_WORKSPACE/dist/public
+        run: cd ../cloud-app && VITE_IS_LOCAL_SERVER=true npx vite build && mkdir -p $GITHUB_WORKSPACE/dist/public && cp -r dist/public/* $GITHUB_WORKSPACE/dist/public/
       - uses: actions/upload-artifact@v4
         with:
           name: frontend-build
