@@ -6,7 +6,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import os from 'os';
-import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount, getUnpushedChanges, getFullRow, markChangesPushed, upsertRow, withoutTriggers, SYNCED_TABLES, insertErrorLog, getRecentErrorLogs, getErrorLogCount, pruneOldErrorLogs } from '../db/sqlite';
+import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPlay, getUnpushedChangeCount, getUnpushedChanges, getFullRow, markChangesPushed, upsertRow, withoutTriggers, SYNCED_TABLES, insertErrorLog, getRecentErrorLogs, getErrorLogCount, pruneOldErrorLogs, reconcileScreenLicenseStatuses, enforceLocalFreeScreenLimit } from '../db/sqlite';
 import { startMdns, stopMdns, scanForExistingHubs, getMdnsStatus } from './mdns';
 import { CloudSync } from './cloud-sync';
 import { getConnectedPlayers, registerPlayer, unregisterPlayer, broadcastToPlayers } from './player-bus';
@@ -238,6 +238,8 @@ async function autoSyncOnStartup() {
     initialSyncStatus = { inProgress: true, step: 'Pulling data from cloud...', error: null, completedAt: null };
     try {
       const totalSynced = await pullFullDataViaHubToken(syncState.cloud_url, syncState.hub_token);
+      reconcileScreenLicenseStatuses();
+      enforceLocalFreeScreenLimit();
       console.log(`[auto-sync] Full pull complete — ${totalSynced} rows synced`);
       initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
     } catch (e: any) {
@@ -429,6 +431,8 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
       try {
         const syncState = getSyncState();
         const totalSynced = await pullFullDataViaHubToken(syncState!.cloud_url, syncState!.hub_token);
+        reconcileScreenLicenseStatuses();
+        enforceLocalFreeScreenLimit();
         console.log(`[initial-sync] Full pull via hub token complete — ${totalSynced} rows`);
         initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
       } catch (e: any) {
@@ -466,6 +470,9 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
       initialSyncStatus.step = step;
     });
   }
+
+  reconcileScreenLicenseStatuses();
+  enforceLocalFreeScreenLimit();
 
   const finalSyncState = getSyncState();
   const hubRegistered = !!finalSyncState?.hub_token && !finalSyncState?.hub_revoked;
@@ -1617,6 +1624,8 @@ export async function startServer(port: number): Promise<number> {
       if (!hasIncrementalChanges || fullSync) {
         console.log(`[cloud-pull] ${fullSync ? 'Full sync requested' : 'No incremental changes'} — performing full data pull via hub token...`);
         const totalSynced = await pullFullDataViaHubToken(cloudUrl, hubToken);
+        reconcileScreenLicenseStatuses();
+        enforceLocalFreeScreenLimit();
         if (totalSynced > 0) {
           broadcastToPlayers({ type: 'contentUpdated', payload: {} });
         }
@@ -1657,6 +1666,13 @@ export async function startServer(port: number): Promise<number> {
       });
 
       updateSyncState({ last_sync_at: new Date().toISOString() });
+
+      const hasLicenseChanges = changes.some((c: any) => c.tableName === 'licenses' || c.tableName === 'screens');
+      if (hasLicenseChanges) {
+        reconcileScreenLicenseStatuses();
+        enforceLocalFreeScreenLimit();
+      }
+
       if (totalSynced > 0) {
         broadcastToPlayers({ type: 'contentUpdated', payload: {} });
       }
@@ -2575,6 +2591,7 @@ export async function startServer(port: number): Promise<number> {
 
       const subscriberId = req.session.subscriberId;
       const devicePlan = plan || 'free';
+      let selectedLicenseId: number | null = null;
 
       if (devicePlan !== 'free') {
         if (cloudSync) {
@@ -2590,7 +2607,9 @@ export async function startServer(port: number): Promise<number> {
         const freshLicenses = await storage.getLicensesBySubscriber(subscriberId);
         const availableLicense = freshLicenses.find((l: any) => l.planTier === devicePlan && ['active', 'canceling', 'trial'].includes(l.status) && !l.screenId);
 
-        if (!availableLicense && useTrial) {
+        if (availableLicense) {
+          selectedLicenseId = availableLicense.id;
+        } else if (useTrial) {
           const syncState = getSyncState();
           const hubToken = syncState?.hub_token;
           const cloudUrl = syncState?.cloud_url || 'https://digipalsignage.com';
@@ -2626,11 +2645,12 @@ export async function startServer(port: number): Promise<number> {
             if (!trialLicense) {
               return res.status(500).json({ message: 'Trial was started but license was not synced. Please try again.' });
             }
+            selectedLicenseId = trialLicense.id;
           } catch (e: any) {
             console.error('[pair] Trial start failed:', e.message);
             return res.status(503).json({ message: 'Failed to start trial. Check your internet connection.' });
           }
-        } else if (!availableLicense) {
+        } else {
           return res.status(400).json({ message: `No available ${devicePlan} license found. Please purchase a license first.` });
         }
       } else if (cloudSync) {
@@ -2656,15 +2676,10 @@ export async function startServer(port: number): Promise<number> {
         WHERE id = ?
       `).run(subscriberId, screenName, devicePlan, screen.id);
 
-      if (devicePlan !== 'free') {
-        const subscriberLicenses = await storage.getLicensesBySubscriber(subscriberId);
-        const existingScreenLicense = subscriberLicenses.find((l: any) => l.screenId === screen.id && ['active', 'canceling', 'trial'].includes(l.status));
-        if (!existingScreenLicense) {
-          const availableLicense = subscriberLicenses.find((l: any) => l.planTier === devicePlan && ['active', 'canceling', 'trial'].includes(l.status) && !l.screenId);
-          if (availableLicense) {
-            await storage.assignLicenseToScreen(availableLicense.id, screen.id);
-          }
-        }
+      if (devicePlan !== 'free' && selectedLicenseId) {
+        await storage.assignLicenseToScreen(selectedLicenseId, screen.id);
+      } else {
+        db.prepare("UPDATE screens SET license_status = 'none' WHERE id = ?").run(screen.id);
       }
 
       const updatedScreen = db.prepare('SELECT * FROM screens WHERE id = ?').get(screen.id) as any;
