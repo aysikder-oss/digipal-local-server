@@ -1433,8 +1433,28 @@ export class SqliteStorage implements ILocalStorage {
   }
 
   async assignLicenseToScreen(licenseId: number, screenId: number) {
+    const oldLicense = this.db.prepare('SELECT * FROM licenses WHERE id = ?').get(licenseId) as any;
+    const oldScreenId = oldLicense?.screen_id;
+
     this.db.prepare('UPDATE licenses SET screen_id = ? WHERE id = ?').run(screenId, licenseId);
-    return rowToCamel(this.db.prepare('SELECT * FROM licenses WHERE id = ?').get(licenseId))!;
+
+    const license = this.db.prepare('SELECT * FROM licenses WHERE id = ?').get(licenseId) as any;
+    if (license) {
+      this.db.prepare('UPDATE screens SET license_status = ? WHERE id = ?').run(license.status, screenId);
+    }
+
+    if (oldScreenId && oldScreenId !== screenId) {
+      const remainingLicense = this.db.prepare(
+        "SELECT status FROM licenses WHERE screen_id = ? AND status IN ('active', 'canceling', 'trial') LIMIT 1"
+      ).get(oldScreenId) as any;
+      if (remainingLicense) {
+        this.db.prepare('UPDATE screens SET license_status = ? WHERE id = ?').run(remainingLicense.status, oldScreenId);
+      } else {
+        this.db.prepare("UPDATE screens SET license_status = 'none' WHERE id = ?").run(oldScreenId);
+      }
+    }
+
+    return rowToCamel(license)!;
   }
 
   async getSubscriptionGroupsBySubscriber(subscriberId: number) {
