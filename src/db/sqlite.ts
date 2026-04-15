@@ -1247,6 +1247,26 @@ export function isCloudGracePeriodExceeded(): boolean {
   return (now - lastContact) > gracePeriodMs;
 }
 
+export function reconcileScreenLicenseStatuses(): void {
+  const allScreens = db.prepare('SELECT id FROM screens').all() as any[];
+  for (const screen of allScreens) {
+    const activeLicense = db.prepare(
+      "SELECT status FROM licenses WHERE screen_id = ? AND status IN ('active', 'canceling', 'trial') LIMIT 1"
+    ).get(screen.id) as any;
+    if (activeLicense) {
+      db.prepare("UPDATE screens SET license_status = ? WHERE id = ?").run(activeLicense.status, screen.id);
+    } else {
+      const anyLicense = db.prepare("SELECT status FROM licenses WHERE screen_id = ? LIMIT 1").get(screen.id) as any;
+      if (anyLicense) {
+        db.prepare("UPDATE screens SET license_status = ? WHERE id = ?").run(anyLicense.status, screen.id);
+      } else {
+        db.prepare("UPDATE screens SET license_status = 'none' WHERE id = ?").run(screen.id);
+      }
+    }
+  }
+  console.log(`[reconcile] Reconciled license_status for ${allScreens.length} screens`);
+}
+
 export function isScreenAllowedToPlay(pairingCode: string): { allowed: boolean; reason?: string } {
   if (isHubRevoked()) {
     return { allowed: false, reason: 'hub_revoked' };
@@ -1262,6 +1282,13 @@ export function isScreenAllowedToPlay(pairingCode: string): { allowed: boolean; 
   }
 
   if (screen.license_status === 'expired') {
+    const activeLicense = db.prepare(
+      "SELECT status FROM licenses WHERE screen_id = ? AND status IN ('active', 'canceling', 'trial') LIMIT 1"
+    ).get(screen.id) as any;
+    if (activeLicense) {
+      db.prepare("UPDATE screens SET license_status = ? WHERE id = ?").run(activeLicense.status, screen.id);
+      return { allowed: true };
+    }
     return { allowed: false, reason: 'license_expired' };
   }
 
@@ -1270,14 +1297,32 @@ export function isScreenAllowedToPlay(pairingCode: string): { allowed: boolean; 
 
 export function enforceLocalFreeScreenLimit(): void {
   const allScreens = db.prepare(
-    "SELECT * FROM screens WHERE license_status != 'expired' ORDER BY created_at ASC"
+    "SELECT * FROM screens ORDER BY created_at ASC"
   ).all() as any[];
 
-  const activeScreens = allScreens.filter((s: any) => s.license_status === 'active');
+  const licensedScreenIds = new Set<number>();
+  const activeLicenses = db.prepare(
+    "SELECT screen_id FROM licenses WHERE screen_id IS NOT NULL AND status IN ('active', 'canceling', 'trial')"
+  ).all() as any[];
+  for (const lic of activeLicenses) {
+    licensedScreenIds.add(lic.screen_id);
+  }
 
-  if (activeScreens.length > 0) return;
+  for (const screen of allScreens) {
+    if (licensedScreenIds.has(screen.id) && screen.license_status === 'expired') {
+      const lic = db.prepare(
+        "SELECT status FROM licenses WHERE screen_id = ? AND status IN ('active', 'canceling', 'trial') LIMIT 1"
+      ).get(screen.id) as any;
+      if (lic) {
+        db.prepare("UPDATE screens SET license_status = ? WHERE id = ?").run(lic.status, screen.id);
+      }
+    }
+  }
 
-  const freeScreens = allScreens.filter((s: any) => s.license_status === 'none' || s.license_status === 'free');
+  const freeScreens = allScreens.filter((s: any) => !licensedScreenIds.has(s.id) && s.license_status !== 'expired');
+
+  if (licensedScreenIds.size > 0) return;
+
   if (freeScreens.length <= 1) return;
 
   const [keepScreen, ...excessScreens] = freeScreens;
