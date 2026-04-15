@@ -12,8 +12,10 @@ import { CloudSync } from './cloud-sync';
 import { getConnectedPlayers, registerPlayer, unregisterPlayer, broadcastToPlayers } from './player-bus';
 import { SqliteStorage, rowsToCamel, rowToCamel } from '../db/sqlite-storage';
 import { authenticateUser, getSessionSubscriber, initSessionTable, createSession, getSession, deleteSession, cleanExpiredSessions } from './auth';
-import { saveUploadedFile, getMediaDir, getMediaDiskUsage, deleteLocalFile } from './file-storage';
+import { saveUploadedFile, getMediaDir, getMediaDiskUsage, deleteLocalFile, generateThumbnailBase64, generateVideoThumbnailBase64, isVideoFile } from './file-storage';
+import { PLAN_STORAGE_PER_LICENSE_MB, DEFAULT_STORAGE_PER_LICENSE_MB } from '../shared-constants';
 import { generateQrSvg, generateQrDataUrl, generateQrBuffer } from './qr-generator';
+import { buildSecureCookie, isRequestSecure } from './crypto-utils';
 
 let server: http.Server | null = null;
 let wss: WebSocketServer | null = null;
@@ -875,18 +877,33 @@ export async function startServer(port: number): Promise<number> {
 
   const app = express();
 
+  const getAllowedOrigins = (): string[] => {
+    const port = boundPort;
+    const origins = [
+      `http://localhost:${port}`,
+      `http://127.0.0.1:${port}`,
+      `http://[::1]:${port}`,
+    ];
+    try {
+      const ifaces = os.networkInterfaces();
+      for (const name of Object.keys(ifaces)) {
+        for (const iface of ifaces[name] || []) {
+          if (iface.family === 'IPv4' && !iface.internal) {
+            origins.push(`http://${iface.address}:${port}`);
+          }
+        }
+      }
+    } catch {}
+    return origins;
+  };
+
   app.use(cors({
     origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
       if (!origin) return callback(null, true);
-      try {
-        const url = new URL(origin);
-        const h = url.hostname;
-        const isLocal = h === 'localhost' || h === '127.0.0.1' || h === '::1';
-        const isPrivateIP = /^(10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)$/.test(h);
-        if (isLocal || isPrivateIP) {
-          return callback(null, true);
-        }
-      } catch (e) { /* invalid origin */ }
+      const allowed = getAllowedOrigins();
+      if (allowed.includes(origin)) {
+        return callback(null, true);
+      }
       callback(new Error('CORS not allowed'));
     },
     credentials: true,
@@ -955,7 +972,7 @@ export async function startServer(port: number): Promise<number> {
       for (const t of tables) {
         try { counts[t] = (db.prepare(`SELECT COUNT(*) as c FROM ${t}`).get() as any).c; } catch { counts[t] = -1; }
       }
-      const sessions = db.prepare('SELECT id, subscriber_id, created_at FROM sessions').all();
+      const sessionRows = db.prepare('SELECT subscriber_id, created_at, expires_at FROM sessions').all() as any[];
       const syncState = getSyncState();
       const recentErrors = getRecentErrorLogs(10);
       const unpushedChanges = getUnpushedChangeCount();
@@ -964,9 +981,17 @@ export async function startServer(port: number): Promise<number> {
         ok: true,
         version,
         counts,
-        sessions,
+        sessions: {
+          count: sessionRows.length,
+          entries: sessionRows.map((s: any) => ({
+            subscriber_id: s.subscriber_id,
+            created_at: s.created_at,
+            expires_at: s.expires_at,
+          })),
+        },
         syncState: {
-          hub_token: syncState?.hub_token ? '***' : null,
+          hub_token: syncState?.hub_token ? '[REDACTED]' : null,
+          cloud_session_cookie: syncState?.cloud_session_cookie ? '[REDACTED]' : null,
           cloud_url: syncState?.cloud_url,
           last_sync_at: syncState?.last_sync_at,
           last_cloud_contact_at: syncState?.last_cloud_contact_at,
@@ -980,7 +1005,7 @@ export async function startServer(port: number): Promise<number> {
         uptime: process.uptime(),
         memoryUsage: process.memoryUsage(),
       });
-    } catch (e: any) { res.json({ ok: false, error: e.message, stack: e.stack }); }
+    } catch (e: any) { res.json({ ok: false, error: e.message }); }
   });
 
   app.get('/api/diagnostics/errors', (_req: Request, res: Response) => {
@@ -1013,7 +1038,7 @@ export async function startServer(port: number): Promise<number> {
 
     const sessionId = createSession(subscriber.id, !!rememberMe);
     const cookieMaxAge = rememberMe ? 90 * 24 * 60 * 60 : 24 * 60 * 60;
-    res.setHeader('Set-Cookie', `session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${cookieMaxAge}`);
+    res.setHeader('Set-Cookie', buildSecureCookie('session', sessionId, { path: '/', httpOnly: true, sameSite: 'Lax', maxAge: cookieMaxAge, isSecure: isRequestSecure(req) }));
 
     if (isOwner && !hubAlreadyRegistered) {
       const syncPromise = runInitialCloudSync(subscriber.id as number, cloudUrl, email, password, capturedCookie);
@@ -1737,7 +1762,7 @@ export async function startServer(port: number): Promise<number> {
   app.post('/api/customer/logout', (req: Request, res: Response) => {
     const token = req.session?.token;
     if (token) deleteSession(token);
-    res.setHeader('Set-Cookie', 'session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+    res.setHeader('Set-Cookie', buildSecureCookie('session', '', { path: '/', httpOnly: true, sameSite: 'Lax', maxAge: 0, isSecure: isRequestSecure(req) }));
     res.json({ ok: true });
   });
 
@@ -1762,7 +1787,7 @@ export async function startServer(port: number): Promise<number> {
       const db = getDb();
       db.prepare('DELETE FROM sessions').run();
       initialSyncStatus = { inProgress: false, step: '', error: '', completedAt: null };
-      res.setHeader('Set-Cookie', 'session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+      res.setHeader('Set-Cookie', buildSecureCookie('session', '', { path: '/', httpOnly: true, sameSite: 'Lax', maxAge: 0, isSecure: isRequestSecure(_req) }));
       console.log('[logout-reset] Reset complete — ready for fresh login');
       res.json({ ok: true });
     } catch (e: any) {
@@ -1892,14 +1917,30 @@ export async function startServer(port: number): Promise<number> {
     });
   });
 
-  app.get('/api/customer/storage', requireAuth, async (_req: Request, res: Response) => {
+
+  app.get('/api/customer/storage', requireAuth, async (req: Request, res: Response) => {
     try {
       const { totalBytes } = getMediaDiskUsage();
       const usedMb = Math.round(totalBytes / 1024 / 1024);
-      const totalMb = 10240;
+
+      const db = getDb();
+      const licenses = db.prepare(
+        "SELECT plan_tier FROM licenses WHERE subscriber_id = ? AND status IN ('active', 'canceling', 'trial')"
+      ).all(req.session.subscriberId) as Array<{ plan_tier: string }>;
+
+      let totalMb: number;
+      let licenseCount: number;
+      if (licenses.length > 0) {
+        totalMb = licenses.reduce((sum, l) => sum + (PLAN_STORAGE_PER_LICENSE_MB[l.plan_tier] || DEFAULT_STORAGE_PER_LICENSE_MB), 0);
+        licenseCount = licenses.length;
+      } else {
+        totalMb = DEFAULT_STORAGE_PER_LICENSE_MB;
+        licenseCount = 0;
+      }
+
       const percentUsed = totalMb > 0 ? Math.round((usedMb / totalMb) * 100) : 0;
-      res.json({ usedBytes: totalBytes, totalBytes: totalMb * 1024 * 1024, usedMb, totalMb, percentUsed, licenseCount: 1 });
-    } catch { res.json({ usedBytes: 0, totalBytes: 10240 * 1024 * 1024, usedMb: 0, totalMb: 10240, percentUsed: 0, licenseCount: 1 }); }
+      res.json({ usedBytes: totalBytes, totalBytes: totalMb * 1024 * 1024, usedMb, totalMb, percentUsed, licenseCount });
+    } catch { res.json({ usedBytes: 0, totalBytes: DEFAULT_STORAGE_PER_LICENSE_MB * 1024 * 1024, usedMb: 0, totalMb: DEFAULT_STORAGE_PER_LICENSE_MB, percentUsed: 0, licenseCount: 0 }); }
   });
 
   app.get('/api/customer/workspaces', requireAuth, async (req: Request, res: Response) => {
@@ -2118,7 +2159,7 @@ export async function startServer(port: number): Promise<number> {
 
     const sessionId = createSession(subscriber.id, !!rememberMe);
     const cookieMaxAge = rememberMe ? 90 * 24 * 60 * 60 : 24 * 60 * 60;
-    res.setHeader('Set-Cookie', `session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${cookieMaxAge}`);
+    res.setHeader('Set-Cookie', buildSecureCookie('session', sessionId, { path: '/', httpOnly: true, sameSite: 'Lax', maxAge: cookieMaxAge, isSecure: isRequestSecure(req) }));
 
     if (isOwner && !hubAlreadyRegistered) {
       const syncPromise = runInitialCloudSync(subscriber.id, cloudUrl, email, password, capturedCookie);
@@ -2167,7 +2208,7 @@ export async function startServer(port: number): Promise<number> {
   app.post('/api/auth/logout', (req: Request, res: Response) => {
     const token = req.session?.token;
     if (token) deleteSession(token);
-    res.setHeader('Set-Cookie', 'session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+    res.setHeader('Set-Cookie', buildSecureCookie('session', '', { path: '/', httpOnly: true, sameSite: 'Lax', maxAge: 0, isSecure: isRequestSecure(req) }));
     res.json({ ok: true });
   });
 
@@ -2717,6 +2758,7 @@ export async function startServer(port: number): Promise<number> {
       }
 
       res.json(camelScreen);
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) {
       console.error('[route] POST /api/customer/screens/pair error:', e);
       res.status(500).json({ message: e.message });
@@ -2753,8 +2795,27 @@ export async function startServer(port: number): Promise<number> {
 
       const updated = await storage.assignLicenseToScreen(license.id, screen.id);
       res.json(updated);
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) {
       console.error('[route] POST /api/customer/licenses/:id/assign error:', e);
+      res.status(500).json({ message: e.message });
+    }
+  });
+
+  app.post('/api/licenses/:id/unassign', requireAuth, requirePermission('billing.manage'), async (req: Request, res: Response) => {
+    try {
+      const license = await storage.getLicense(Number(req.params.id));
+      if (!license || license.subscriberId !== req.session.subscriberId) {
+        return res.status(404).json({ message: 'License not found' });
+      }
+      if (!license.screenId) {
+        return res.status(400).json({ message: 'This license is not assigned to any screen.' });
+      }
+
+      const updated = await storage.unassignLicenseFromScreen(license.id);
+      res.json(updated);
+    } catch (e: any) {
+      console.error('[route] POST /api/licenses/:id/unassign error:', e);
       res.status(500).json({ message: e.message });
     }
   });
@@ -2763,6 +2824,7 @@ export async function startServer(port: number): Promise<number> {
     try {
       const screen = await storage.createScreen({ ...req.body, ownerId: req.session.subscriberId });
       res.json(screen);
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -2794,6 +2856,7 @@ export async function startServer(port: number): Promise<number> {
       }
 
       res.json(screen);
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -2855,6 +2918,7 @@ export async function startServer(port: number): Promise<number> {
       }
 
       res.json(screen);
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -2880,6 +2944,7 @@ export async function startServer(port: number): Promise<number> {
     try {
       await storage.deleteScreen(Number(req.params.id));
       res.json({ ok: true });
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -3032,10 +3097,15 @@ export async function startServer(port: number): Promise<number> {
       const file = req.file;
       let localPath = '';
       let url = '';
+      let thumbnailUrl: string | null = null;
       if (file) {
         const saved = saveUploadedFile(file.buffer, file.originalname);
         localPath = saved.filePath;
         url = `/media/${saved.fileName}`;
+        thumbnailUrl = generateThumbnailBase64(saved.filePath, file.mimetype);
+        if (!thumbnailUrl && isVideoFile(saved.filePath)) {
+          thumbnailUrl = await generateVideoThumbnailBase64(saved.filePath);
+        }
       }
       const content = await storage.createContent({
         ...req.body,
@@ -3044,8 +3114,10 @@ export async function startServer(port: number): Promise<number> {
         url: url || req.body.url || req.body.data,
         fileSize: file?.size || req.body.fileSize,
         mimeType: file?.mimetype || req.body.mimeType,
+        ...(thumbnailUrl ? { thumbnailUrl } : {}),
       });
       res.json(content);
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -3053,6 +3125,7 @@ export async function startServer(port: number): Promise<number> {
     try {
       const content = await storage.updateContent(Number(req.params.id), req.body);
       res.json(content);
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -3062,6 +3135,7 @@ export async function startServer(port: number): Promise<number> {
       if (content?.localPath) deleteLocalFile(path.basename(content.localPath));
       await storage.deleteContent(Number(req.params.id));
       res.json({ ok: true });
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -3188,6 +3262,7 @@ export async function startServer(port: number): Promise<number> {
     try {
       const playlist = await storage.createPlaylist({ ...req.body, ownerId: req.session.subscriberId });
       res.json(playlist);
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -3195,6 +3270,7 @@ export async function startServer(port: number): Promise<number> {
     try {
       const playlist = await storage.updatePlaylist(Number(req.params.id), req.body);
       res.json(playlist);
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -3202,6 +3278,7 @@ export async function startServer(port: number): Promise<number> {
     try {
       await storage.deletePlaylist(Number(req.params.id));
       res.json({ ok: true });
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -3290,6 +3367,7 @@ export async function startServer(port: number): Promise<number> {
     try {
       const schedule = await storage.createSchedule(req.body);
       res.json(schedule);
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -3297,6 +3375,7 @@ export async function startServer(port: number): Promise<number> {
     try {
       const schedule = await storage.updateSchedule(Number(req.params.id), req.body);
       res.json(schedule);
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
@@ -3304,6 +3383,7 @@ export async function startServer(port: number): Promise<number> {
     try {
       await storage.deleteSchedule(Number(req.params.id));
       res.json({ ok: true });
+      if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 

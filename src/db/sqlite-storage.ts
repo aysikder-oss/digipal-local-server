@@ -232,6 +232,7 @@ export interface ILocalStorage {
   getLicenseByScreenId(screenId: number): Promise<DataRecord | undefined>;
   getAvailableLicenses(subscriberId: number): Promise<DataRecord[]>;
   assignLicenseToScreen(licenseId: number, screenId: number): Promise<DataRecord>;
+  unassignLicenseFromScreen(licenseId: number): Promise<DataRecord>;
   getSubscriptionGroupsBySubscriber(subscriberId: number): Promise<DataRecord[]>;
 
   getDesignTemplates(): Promise<DataRecord[]>;
@@ -1455,6 +1456,27 @@ export class SqliteStorage implements ILocalStorage {
     }
 
     return rowToCamel(license)!;
+  }
+
+  async unassignLicenseFromScreen(licenseId: number) {
+    const license = this.db.prepare('SELECT * FROM licenses WHERE id = ?').get(licenseId) as any;
+    if (!license) throw new Error('License not found');
+
+    const screenId = license.screen_id;
+    this.db.prepare('UPDATE licenses SET screen_id = NULL WHERE id = ?').run(licenseId);
+
+    if (screenId) {
+      const remainingLicense = this.db.prepare(
+        "SELECT status FROM licenses WHERE screen_id = ? AND status IN ('active', 'canceling', 'trial') LIMIT 1"
+      ).get(screenId) as any;
+      if (remainingLicense) {
+        this.db.prepare('UPDATE screens SET license_status = ? WHERE id = ?').run(remainingLicense.status, screenId);
+      } else {
+        this.db.prepare("UPDATE screens SET license_status = 'none' WHERE id = ?").run(screenId);
+      }
+    }
+
+    return rowToCamel(this.db.prepare('SELECT * FROM licenses WHERE id = ?').get(licenseId))!;
   }
 
   async getSubscriptionGroupsBySubscriber(subscriberId: number) {

@@ -17,11 +17,30 @@ import {
   markErrorLogsSent,
   pruneOldErrorLogs,
   insertErrorLog,
+  setIdMapping,
+  getCloudId,
+  getLocalId,
+  removeIdMapping,
+  getUnmappedLocalRecords,
+  logSyncConflict,
 } from '../db/sqlite';
 import { broadcastToPlayers } from './player-bus';
 
 const STANDARD_SYNC_INTERVAL = 60 * 60 * 1000;
 const LAZY_SYNC_INTERVAL = 24 * 60 * 60 * 1000;
+
+const FK_REMAP_RULES: Record<string, Record<string, string>> = {
+  playlist_items: { playlist_id: 'playlists', content_id: 'contents' },
+  schedules: { screen_id: 'screens', content_id: 'contents', playlist_id: 'playlists', video_wall_id: 'video_walls' },
+  video_wall_screens: { wall_id: 'video_walls', screen_id: 'screens' },
+  screen_group_members: { group_id: 'screen_groups', screen_id: 'screens' },
+  smart_triggers: { screen_id: 'screens', target_content_id: 'contents', target_playlist_id: 'playlists', fallback_content_id: 'contents' },
+  team_screens: { team_id: 'teams', screen_id: 'screens' },
+  team_members: { team_id: 'teams' },
+  team_roles: { team_id: 'teams' },
+  dooh_ad_slots: { screen_id: 'screens' },
+  screens: { content_id: 'contents', playlist_id: 'playlists', video_wall_id: 'video_walls' },
+};
 
 export class CloudSync {
   private ws: WebSocket | null = null;
@@ -38,6 +57,7 @@ export class CloudSync {
   private pushAckPending = new Set<number>();
   private onAuthFailure?: () => void;
   private consecutiveFailures = 0;
+  private pendingNonInserts: any[] | null = null;
   private static readonly BASE_RECONNECT_MS = 10_000;
   private static readonly MAX_RECONNECT_MS = 5 * 60 * 1000;
 
@@ -213,6 +233,66 @@ export class CloudSync {
           markChangesPushed(ackedIds);
           console.log(`[cloud-sync] ${ackedIds.length} changes acknowledged by cloud`);
         }
+        const failedIds = data.payload?.failedIds || [];
+        const errors = data.payload?.errors || [];
+        if (failedIds.length > 0) {
+          console.warn(`[cloud-sync] ${failedIds.length} changes failed on cloud — will retry on next sync`);
+          for (const err of errors) {
+            console.warn(`[cloud-sync]   Failed: ${err.tableName} (changeId=${err.changeId}): ${err.error}`);
+            insertErrorLog({
+              level: 'warn',
+              source: 'cloud-sync',
+              message: `Cloud rejected sync change for ${err.tableName}: ${err.error}`,
+              context: { changeId: err.changeId, tableName: err.tableName },
+            });
+          }
+        }
+        const mappings = data.payload?.idMappings;
+        if (Array.isArray(mappings) && mappings.length > 0) {
+          for (const m of mappings) {
+            if (m.tableName && m.localId && m.cloudId) {
+              setIdMapping(m.tableName, m.localId, m.cloudId);
+              console.log(`[cloud-sync] ID mapping: ${m.tableName} local=${m.localId} -> cloud=${m.cloudId}`);
+            }
+          }
+        }
+        if (this.pendingNonInserts && this.pendingNonInserts.length > 0) {
+          const deferred = this.pendingNonInserts;
+          this.pendingNonInserts = null;
+          console.log(`[cloud-sync] INSERT ACK received, now pushing ${deferred.length} deferred UPDATE/DELETE changes`);
+          const mapChange = (change: any) => {
+            const row = change.operation !== 'DELETE'
+              ? getFullRow(change.table_name, change.record_id)
+              : null;
+            let effectiveRecordId = change.record_id;
+            if (change.operation === 'UPDATE' || change.operation === 'DELETE') {
+              const cloudId = getCloudId(change.table_name, change.record_id);
+              if (cloudId) effectiveRecordId = cloudId;
+            }
+            let changeData = row || JSON.parse(change.payload || '{}');
+            if (change.operation !== 'DELETE' && changeData) {
+              changeData = this.remapForeignKeys(change.table_name, changeData);
+            }
+            if (effectiveRecordId !== change.record_id && changeData) {
+              changeData.id = effectiveRecordId;
+            }
+            return {
+              id: change.id,
+              tableName: change.table_name,
+              recordId: effectiveRecordId,
+              localRecordId: change.record_id,
+              operation: change.operation,
+              data: changeData,
+            };
+          };
+          const changes = deferred.map(mapChange);
+          this.send({
+            type: 'hubSyncPush',
+            payload: { changes },
+          });
+        } else {
+          this.pendingNonInserts = null;
+        }
         break;
       }
 
@@ -296,6 +376,7 @@ export class CloudSync {
       console.log('[cloud-sync] Standard tier sync pull (with subscription refresh)');
       this.syncSubscriptionFirst().catch(() => {}).then(() => {
         this.pullChanges(['standard']);
+        this.reconcileUnmappedRecords();
       });
     }, STANDARD_SYNC_INTERVAL);
 
@@ -313,6 +394,41 @@ export class CloudSync {
     if (this.lazySyncInterval) {
       clearInterval(this.lazySyncInterval);
       this.lazySyncInterval = null;
+    }
+  }
+
+  private reconcileUnmappedRecords() {
+    try {
+      const unmapped = getUnmappedLocalRecords();
+      if (unmapped.length === 0) return;
+
+      const alreadyPendingChanges = getUnpushedChanges();
+      const pendingSet = new Set(
+        alreadyPendingChanges.map((c: any) => `${c.table_name}:${c.record_id}`)
+      );
+
+      let enqueued = 0;
+      for (const { tableName, localId } of unmapped) {
+        const key = `${tableName}:${localId}`;
+        if (pendingSet.has(key)) continue;
+
+        const row = getFullRow(tableName, localId);
+        if (!row) continue;
+
+        const db = getDb();
+        db.prepare(`
+          INSERT INTO sync_change_log (table_name, record_id, operation, payload, pushed)
+          VALUES (?, ?, 'INSERT', ?, 0)
+        `).run(tableName, localId, JSON.stringify(row));
+        enqueued++;
+      }
+
+      if (enqueued > 0) {
+        console.log(`[cloud-sync] Reconciliation: enqueued ${enqueued} unmapped records for sync (of ${unmapped.length} total unmapped)`);
+        this.pushChanges();
+      }
+    } catch (err: any) {
+      console.error('[cloud-sync] Reconciliation failed:', err.message);
     }
   }
 
@@ -345,29 +461,100 @@ export class CloudSync {
     });
   }
 
+  private remapForeignKeys(tableName: string, data: Record<string, any>): Record<string, any> {
+    const rules = FK_REMAP_RULES[tableName];
+    if (!rules || !data) return data;
+    const remapped = { ...data };
+    for (const [fkCol, refTable] of Object.entries(rules)) {
+      const localFkId = remapped[fkCol];
+      if (localFkId && typeof localFkId === 'number') {
+        const cloudFkId = getCloudId(refTable, localFkId);
+        if (cloudFkId) {
+          remapped[fkCol] = cloudFkId;
+        }
+      }
+    }
+    return remapped;
+  }
+
+  private unremapForeignKeys(tableName: string, data: Record<string, any>): Record<string, any> {
+    const rules = FK_REMAP_RULES[tableName];
+    if (!rules || !data) return data;
+    const remapped = { ...data };
+    for (const [fkCol, refTable] of Object.entries(rules)) {
+      const cloudFkId = remapped[fkCol];
+      if (cloudFkId && typeof cloudFkId === 'number') {
+        const localFkId = getLocalId(refTable, cloudFkId);
+        if (localFkId) {
+          remapped[fkCol] = localFkId;
+        }
+      }
+    }
+    return remapped;
+  }
+
   private pushChanges() {
     const unpushed = getUnpushedChanges();
     if (unpushed.length === 0) return;
 
-    const changes = unpushed.map((change: any) => {
+    const inserts: any[] = [];
+    const nonInserts: any[] = [];
+
+    for (const change of unpushed) {
+      if (change.operation === 'INSERT') {
+        inserts.push(change);
+      } else {
+        nonInserts.push(change);
+      }
+    }
+
+    const mapChange = (change: any) => {
       const row = change.operation !== 'DELETE'
         ? getFullRow(change.table_name, change.record_id)
         : null;
 
+      let effectiveRecordId = change.record_id;
+      if (change.operation === 'UPDATE' || change.operation === 'DELETE') {
+        const cloudId = getCloudId(change.table_name, change.record_id);
+        if (cloudId) {
+          effectiveRecordId = cloudId;
+        }
+      }
+
+      let data = row || JSON.parse(change.payload || '{}');
+      if (change.operation !== 'DELETE' && data) {
+        data = this.remapForeignKeys(change.table_name, data);
+      }
+      if (effectiveRecordId !== change.record_id && data) {
+        data.id = effectiveRecordId;
+      }
+
       return {
         id: change.id,
         tableName: change.table_name,
-        recordId: change.record_id,
+        recordId: effectiveRecordId,
+        localRecordId: change.record_id,
         operation: change.operation,
-        data: row || JSON.parse(change.payload || '{}'),
+        data,
       };
-    });
+    };
 
-    console.log(`[cloud-sync] Pushing ${changes.length} local changes to cloud`);
-    this.send({
-      type: 'hubSyncPush',
-      payload: { changes },
-    });
+    if (inserts.length > 0) {
+      const insertChanges = inserts.map(mapChange);
+      console.log(`[cloud-sync] Pushing ${insertChanges.length} INSERT changes first (${nonInserts.length} UPDATE/DELETE deferred until ACK)`);
+      this.pendingNonInserts = nonInserts.length > 0 ? nonInserts : null;
+      this.send({
+        type: 'hubSyncPush',
+        payload: { changes: insertChanges },
+      });
+    } else {
+      const changes = nonInserts.map(mapChange);
+      console.log(`[cloud-sync] Pushing ${changes.length} UPDATE/DELETE changes to cloud`);
+      this.send({
+        type: 'hubSyncPush',
+        payload: { changes },
+      });
+    }
   }
 
   private applyChanges(changes: any[]) {
@@ -378,10 +565,9 @@ export class CloudSync {
     let applied = 0;
     let maxTimestamp = '';
     const tierMaxTimestamps: Record<string, string> = {};
-
-    withoutTriggers(() => {
-      for (const change of changes) {
-        try {
+    try {
+      withoutTriggers(() => {
+        for (const change of changes) {
           const tableName = change.tableName;
           const operation = change.operation;
           const data = change.data || change.payload;
@@ -392,13 +578,86 @@ export class CloudSync {
 
           if (operation === 'INSERT' || operation === 'UPDATE') {
             if (data && typeof data === 'object') {
-              upsertRow(tableName, data);
+              const cloudRecordId = data.id || change.recordId;
+              if (cloudRecordId) {
+                const existingLocalId = getLocalId(tableName, cloudRecordId);
+                if (existingLocalId) {
+                  data.id = existingLocalId;
+                } else if (operation === 'INSERT') {
+                  const db = getDb();
+                  const existingRow = db.prepare(`SELECT id FROM ${tableName} WHERE id = ?`).get(cloudRecordId);
+                  if (existingRow) {
+                    const { id: _stripCloudId, ...insertFields } = data;
+                    const remappedInsert = this.unremapForeignKeys(tableName, insertFields);
+                    const cols = Object.keys(remappedInsert);
+                    if (cols.length > 0) {
+                      const placeholders = cols.map(() => '?').join(', ');
+                      const values = cols.map(k => {
+                        const v = remappedInsert[k];
+                        if (v === null || v === undefined) return null;
+                        if (typeof v === 'boolean') return v ? 1 : 0;
+                        if (typeof v === 'object') return JSON.stringify(v);
+                        return v;
+                      });
+                      const sql = `INSERT INTO ${tableName} (${cols.join(', ')}) VALUES (${placeholders})`;
+                      const result = db.prepare(sql).run(...values);
+                      const newLocalId = Number(result.lastInsertRowid);
+                      setIdMapping(tableName, newLocalId, cloudRecordId);
+                      console.log(`[cloud-sync] Cloud INSERT collision avoided: ${tableName} cloud=${cloudRecordId} -> local=${newLocalId}`);
+                      applied++;
+                      if (changeTs && changeTs > maxTimestamp) maxTimestamp = changeTs;
+                      if (changeTs && (!tierMaxTimestamps[tier] || changeTs > tierMaxTimestamps[tier])) {
+                        tierMaxTimestamps[tier] = changeTs;
+                      }
+                      continue;
+                    }
+                  }
+                }
+              }
+              if (operation === 'UPDATE') {
+                const effectiveLocalId = data.id || cloudRecordId;
+                const localRow = getFullRow(tableName, effectiveLocalId);
+                if (localRow) {
+                  const localUpdatedAt = localRow.updated_at;
+                  const incomingUpdatedAt = data.updated_at || data.updatedAt || changeTs;
+                  if (localUpdatedAt && incomingUpdatedAt) {
+                    const localTime = new Date(localUpdatedAt).getTime();
+                    const incomingTime = new Date(incomingUpdatedAt).getTime();
+                    if (!isNaN(localTime) && !isNaN(incomingTime) && localTime > incomingTime) {
+                      console.log(`[cloud-sync] Conflict detected: ${tableName}/${effectiveLocalId} local updated_at=${localUpdatedAt} > incoming=${incomingUpdatedAt} — keeping local (newer-wins)`);
+                      logSyncConflict({
+                        tableName,
+                        recordId: effectiveLocalId,
+                        operation: 'UPDATE',
+                        localVersion: localRow,
+                        incomingVersion: data,
+                        resolution: 'local_wins_newer',
+                        localUpdatedAt,
+                        incomingUpdatedAt: String(incomingUpdatedAt),
+                      });
+                      applied++;
+                      if (changeTs && changeTs > maxTimestamp) maxTimestamp = changeTs;
+                      if (changeTs && (!tierMaxTimestamps[tier] || changeTs > tierMaxTimestamps[tier])) {
+                        tierMaxTimestamps[tier] = changeTs;
+                      }
+                      continue;
+                    }
+                  }
+                }
+              }
+              const remappedData = this.unremapForeignKeys(tableName, data);
+              upsertRow(tableName, remappedData);
               applied++;
             }
           } else if (operation === 'DELETE') {
-            const recordId = change.recordId || data?.id;
-            if (recordId) {
-              deleteRow(tableName, recordId);
+            const cloudRecordId = change.recordId || data?.id;
+            if (cloudRecordId) {
+              const localId = getLocalId(tableName, cloudRecordId);
+              const effectiveId = localId || cloudRecordId;
+              deleteRow(tableName, effectiveId);
+              if (localId) {
+                removeIdMapping(tableName, localId);
+              }
               applied++;
             }
           }
@@ -407,27 +666,29 @@ export class CloudSync {
           if (changeTs && (!tierMaxTimestamps[tier] || changeTs > tierMaxTimestamps[tier])) {
             tierMaxTimestamps[tier] = changeTs;
           }
-        } catch (err: any) {
-          console.error(`[cloud-sync] Failed to apply change to ${change.tableName}:`, err.message);
-          insertErrorLog({
-            level: 'error',
-            source: 'cloud-sync',
-            message: `Failed to apply change to ${change.tableName}: ${err.message}`,
-            stack: err.stack,
-            context: { tableName: change.tableName, operation: change.operation, recordId: change.recordId },
-          });
         }
-      }
-    });
+
+        if (applied > 0 && maxTimestamp) {
+          const updates: Record<string, string> = { last_sync_at: maxTimestamp };
+          if (tierMaxTimestamps['standard']) updates.last_standard_sync_at = tierMaxTimestamps['standard'];
+          if (tierMaxTimestamps['lazy']) updates.last_lazy_sync_at = tierMaxTimestamps['lazy'];
+          updateSyncState(updates);
+        }
+      });
+    } catch (err: any) {
+      const failedTable = err._syncTable || 'unknown';
+      console.error(`[cloud-sync] Batch apply rolled back due to error in ${failedTable}:`, err.message);
+      insertErrorLog({
+        level: 'error',
+        source: 'cloud-sync',
+        message: `Batch apply rolled back: failed on ${failedTable}: ${err.message}`,
+        stack: err.stack,
+        context: { failedTable, totalChanges: changes.length },
+      });
+      return;
+    }
 
     console.log(`[cloud-sync] Applied ${applied}/${changes.length} changes`);
-
-    if (applied > 0 && maxTimestamp) {
-      const updates: Record<string, string> = { last_sync_at: maxTimestamp };
-      if (tierMaxTimestamps['standard']) updates.last_standard_sync_at = tierMaxTimestamps['standard'];
-      if (tierMaxTimestamps['lazy']) updates.last_lazy_sync_at = tierMaxTimestamps['lazy'];
-      updateSyncState(updates);
-    }
 
     const hasLicenseRelatedChanges = changes.some(
       (c) => c.tableName === 'licenses' || (c.tableName === 'screens' && (c.data?.license_status || c.payload?.license_status))

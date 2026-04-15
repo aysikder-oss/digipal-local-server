@@ -108,6 +108,16 @@ export function initDatabase() {
       value TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS hub_id_map (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      table_name TEXT NOT NULL,
+      local_id INTEGER NOT NULL,
+      cloud_id INTEGER NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(table_name, local_id),
+      UNIQUE(table_name, cloud_id)
+    );
+
     CREATE TABLE IF NOT EXISTS subscribers (
       id INTEGER PRIMARY KEY,
       name TEXT NOT NULL,
@@ -1094,10 +1104,25 @@ export function initDatabase() {
     );
     CREATE INDEX IF NOT EXISTS idx_error_logs_sent ON error_logs(sent_to_cloud) WHERE sent_to_cloud = 0;
     CREATE INDEX IF NOT EXISTS idx_error_logs_timestamp ON error_logs(timestamp);
+
+    CREATE TABLE IF NOT EXISTS sync_conflicts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      table_name TEXT NOT NULL,
+      record_id INTEGER NOT NULL,
+      operation TEXT NOT NULL,
+      local_version TEXT,
+      incoming_version TEXT,
+      resolution TEXT NOT NULL,
+      local_updated_at TEXT,
+      incoming_updated_at TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_sync_conflicts_table ON sync_conflicts(table_name);
+    CREATE INDEX IF NOT EXISTS idx_sync_conflicts_created ON sync_conflicts(created_at);
   `);
 
-  setupChangeTriggers(db);
   runMigrations(db);
+  setupChangeTriggers(db);
 
   return db;
 }
@@ -1116,10 +1141,26 @@ function runMigrations(database: Database.Database) {
   addColumnIfMissing('sync_state', 'hub_name', 'TEXT');
   addColumnIfMissing('sync_state', 'sync_enabled', 'INTEGER DEFAULT 1');
   addColumnIfMissing('sync_state', 'cloud_session_cookie', 'TEXT');
+
+  for (const table of SYNCED_TABLES) {
+    database.exec(`DROP TRIGGER IF EXISTS trg_${table}_insert`);
+    database.exec(`DROP TRIGGER IF EXISTS trg_${table}_update`);
+    database.exec(`DROP TRIGGER IF EXISTS trg_${table}_delete`);
+  }
+
+  const { migratePlaintextSyncState } = require('../server/crypto-utils');
+  migratePlaintextSyncState(db);
 }
 
 function setupChangeTriggers(database: Database.Database) {
   for (const table of SYNCED_TABLES) {
+    const cols = database.pragma(`table_info(${table})`) as Array<{ name: string }>;
+    const hasUpdatedAt = cols.some((c) => c.name === 'updated_at');
+
+    const updatePayload = hasUpdatedAt
+      ? `json_object('id', NEW.id, 'updated_at', NEW.updated_at)`
+      : `json_object('id', NEW.id)`;
+
     database.exec(`
       CREATE TRIGGER IF NOT EXISTS trg_${table}_insert AFTER INSERT ON ${table}
       BEGIN
@@ -1130,7 +1171,7 @@ function setupChangeTriggers(database: Database.Database) {
       CREATE TRIGGER IF NOT EXISTS trg_${table}_update AFTER UPDATE ON ${table}
       BEGIN
         INSERT INTO local_changes (table_name, record_id, operation, payload)
-        VALUES ('${table}', NEW.id, 'UPDATE', json_object('id', NEW.id));
+        VALUES ('${table}', NEW.id, 'UPDATE', ${updatePayload});
       END;
 
       CREATE TRIGGER IF NOT EXISTS trg_${table}_delete AFTER DELETE ON ${table}
@@ -1154,13 +1195,17 @@ export function setConfig(key: string, value: string): void {
 }
 
 export function getSyncState() {
-  return db.prepare('SELECT * FROM sync_state WHERE id = 1').get() as any;
+  const { decryptSyncStateFields } = require('../server/crypto-utils');
+  const row = db.prepare('SELECT * FROM sync_state WHERE id = 1').get() as any;
+  return decryptSyncStateFields(row);
 }
 
 export function updateSyncState(updates: Record<string, any>) {
-  const keys = Object.keys(updates);
+  const { encryptSyncStateFields } = require('../server/crypto-utils');
+  const encrypted = encryptSyncStateFields(updates);
+  const keys = Object.keys(encrypted);
   const sets = keys.map(k => `${k} = ?`).join(', ');
-  db.prepare(`UPDATE sync_state SET ${sets} WHERE id = 1`).run(...keys.map(k => updates[k]));
+  db.prepare(`UPDATE sync_state SET ${sets} WHERE id = 1`).run(...keys.map(k => encrypted[k]));
 }
 
 export function getUnpushedChanges(): any[] {
@@ -1334,20 +1379,83 @@ export function enforceLocalFreeScreenLimit(): void {
 }
 
 export function withoutTriggers(fn: () => void): void {
-  for (const table of SYNCED_TABLES) {
-    db.exec(`DROP TRIGGER IF EXISTS trg_${table}_insert`);
-    db.exec(`DROP TRIGGER IF EXISTS trg_${table}_update`);
-    db.exec(`DROP TRIGGER IF EXISTS trg_${table}_delete`);
-  }
-  try {
-    fn();
-  } finally {
-    setupChangeTriggers(db);
-  }
+  const runInTransaction = db.transaction(() => {
+    for (const table of SYNCED_TABLES) {
+      db.exec(`DROP TRIGGER IF EXISTS trg_${table}_insert`);
+      db.exec(`DROP TRIGGER IF EXISTS trg_${table}_update`);
+      db.exec(`DROP TRIGGER IF EXISTS trg_${table}_delete`);
+    }
+    try {
+      fn();
+    } finally {
+      setupChangeTriggers(db);
+    }
+  });
+  runInTransaction();
 }
 
 export function invalidateColumnCache(): void {
   tableColumnsCache = null;
+}
+
+export function setIdMapping(tableName: string, localId: number, cloudId: number): void {
+  db.prepare(
+    'INSERT OR REPLACE INTO hub_id_map (table_name, local_id, cloud_id) VALUES (?, ?, ?)'
+  ).run(tableName, localId, cloudId);
+}
+
+export function getCloudId(tableName: string, localId: number): number | null {
+  const row = db.prepare(
+    'SELECT cloud_id FROM hub_id_map WHERE table_name = ? AND local_id = ?'
+  ).get(tableName, localId) as { cloud_id: number } | undefined;
+  return row?.cloud_id ?? null;
+}
+
+export function getLocalId(tableName: string, cloudId: number): number | null {
+  const row = db.prepare(
+    'SELECT local_id FROM hub_id_map WHERE table_name = ? AND cloud_id = ?'
+  ).get(tableName, cloudId) as { local_id: number } | undefined;
+  return row?.local_id ?? null;
+}
+
+export function removeIdMapping(tableName: string, localId: number): void {
+  db.prepare('DELETE FROM hub_id_map WHERE table_name = ? AND local_id = ?').run(tableName, localId);
+}
+
+const RECONCILABLE_TABLES = [
+  'screens', 'playlists', 'contents', 'schedules', 'playlist_items',
+  'smart_triggers', 'video_walls', 'video_wall_screens', 'content_folders',
+  'layout_templates', 'screen_groups', 'screen_group_members',
+  'emergency_alert_configs', 'custom_alert_feeds', 'dooh_campaigns',
+  'dooh_ad_slots', 'kiosks', 'broadcasts', 'smart_qr_codes',
+  'teams', 'team_roles', 'team_members', 'team_screens', 'team_categories',
+  'directory_venues', 'directory_floors', 'directory_categories',
+  'directory_stores', 'directory_promotions', 'directory_kiosk_positions',
+];
+
+export function getUnmappedLocalRecords(): Array<{ tableName: string; localId: number }> {
+  const results: Array<{ tableName: string; localId: number }> = [];
+  for (const table of RECONCILABLE_TABLES) {
+    try {
+      const tableExists = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
+      ).get(table);
+      if (!tableExists) continue;
+
+      const rows = db.prepare(`
+        SELECT t.id FROM ${table} t
+        LEFT JOIN hub_id_map m ON m.table_name = ? AND m.local_id = t.id
+        WHERE m.id IS NULL
+      `).all(table) as Array<{ id: number }>;
+
+      for (const row of rows) {
+        results.push({ tableName: table, localId: row.id });
+      }
+    } catch {
+      continue;
+    }
+  }
+  return results;
 }
 
 export interface ErrorLogEntry {
@@ -1404,6 +1512,53 @@ export function pruneOldErrorLogs(keepCount = 1000): void {
     const total = getErrorLogCount();
     if (total > keepCount) {
       db.prepare(`DELETE FROM error_logs WHERE id NOT IN (SELECT id FROM error_logs ORDER BY id DESC LIMIT ?)`).run(keepCount);
+    }
+  } catch {
+  }
+}
+
+export function logSyncConflict(entry: {
+  tableName: string;
+  recordId: number;
+  operation: string;
+  localVersion: any;
+  incomingVersion: any;
+  resolution: string;
+  localUpdatedAt?: string;
+  incomingUpdatedAt?: string;
+}): void {
+  try {
+    db.prepare(`
+      INSERT INTO sync_conflicts (table_name, record_id, operation, local_version, incoming_version, resolution, local_updated_at, incoming_updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      entry.tableName,
+      entry.recordId,
+      entry.operation,
+      entry.localVersion ? JSON.stringify(entry.localVersion) : null,
+      entry.incomingVersion ? JSON.stringify(entry.incomingVersion) : null,
+      entry.resolution,
+      entry.localUpdatedAt || null,
+      entry.incomingUpdatedAt || null
+    );
+  } catch {
+  }
+}
+
+export function getSyncConflicts(limit = 50, offset = 0): any[] {
+  return db.prepare('SELECT * FROM sync_conflicts ORDER BY id DESC LIMIT ? OFFSET ?').all(limit, offset);
+}
+
+export function getSyncConflictCount(): number {
+  const row = db.prepare('SELECT COUNT(*) as count FROM sync_conflicts').get() as any;
+  return row?.count || 0;
+}
+
+export function pruneOldSyncConflicts(keepCount = 500): void {
+  try {
+    const total = getSyncConflictCount();
+    if (total > keepCount) {
+      db.prepare(`DELETE FROM sync_conflicts WHERE id NOT IN (SELECT id FROM sync_conflicts ORDER BY id DESC LIMIT ?)`).run(keepCount);
     }
   } catch {
   }
