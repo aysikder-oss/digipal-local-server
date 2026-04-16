@@ -14,6 +14,7 @@ import { registerDashboardClient, unregisterDashboardClient, broadcastToDashboar
 import { SqliteStorage, rowsToCamel, rowToCamel } from '../db/sqlite-storage';
 import { authenticateUser, getSessionSubscriber, initSessionTable, createSession, getSession, deleteSession, cleanExpiredSessions } from './auth';
 import { saveUploadedFile, getMediaDir, getMediaDiskUsage, deleteLocalFile, generateThumbnailBase64, generateVideoThumbnailBase64, isVideoFile } from './file-storage';
+import { startMediaDownloader, stopMediaDownloader, scanAndQueueAllCloudContent, getMediaDownloadStats, getFailedDownloadsByContent, queueContentMediaDownloads } from './media-downloader';
 import { PLAN_STORAGE_PER_LICENSE_MB, DEFAULT_STORAGE_PER_LICENSE_MB } from '../shared-constants';
 import { generateQrSvg, generateQrDataUrl, generateQrBuffer } from './qr-generator';
 import { buildSecureCookie, isRequestSecure } from './crypto-utils';
@@ -246,10 +247,16 @@ async function autoSyncOnStartup() {
       enforceLocalFreeScreenLimit();
       console.log(`[auto-sync] Full pull complete — ${totalSynced} rows synced`);
       initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
+      startMediaDownloader();
+      scanAndQueueAllCloudContent();
     } catch (e: any) {
       console.error('[auto-sync] Full pull failed:', e.message);
       initialSyncStatus = { inProgress: false, step: '', error: 'Failed to pull data from cloud', completedAt: null };
     }
+  }
+
+  if (syncState?.hub_token && !isHubRevoked()) {
+    startMediaDownloader();
   }
 }
 
@@ -439,6 +446,8 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
         enforceLocalFreeScreenLimit();
         console.log(`[initial-sync] Full pull via hub token complete — ${totalSynced} rows`);
         initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
+        startMediaDownloader();
+        scanAndQueueAllCloudContent();
       } catch (e: any) {
         console.error('[initial-sync] Full pull via hub token failed:', e.message);
         initialSyncStatus = { inProgress: false, step: '', error: 'Failed to pull data', completedAt: null };
@@ -484,6 +493,8 @@ async function runInitialCloudSync(subscriberId: number, cloudUrl: string, email
   if (hubRegistered) {
     initialSyncStatus = { inProgress: false, step: 'Complete', error: null, completedAt: new Date().toISOString() };
     console.log(`[initial-sync] Initial cloud data sync complete — ${totalSynced} total rows`);
+    startMediaDownloader();
+    scanAndQueueAllCloudContent();
   } else {
     initialSyncStatus = { inProgress: false, step: '', error: 'Hub registration failed — data was synced via REST but real-time sync is not active', completedAt: null };
     console.log(`[initial-sync] Data sync finished (${totalSynced} rows) but hub registration failed — no hub token`);
@@ -1108,6 +1119,12 @@ export async function startServer(port: number): Promise<number> {
     });
   });
 
+  app.get('/api/customer/media-download-status', requireAuth, (_req: Request, res: Response) => {
+    const stats = getMediaDownloadStats();
+    const failedItems = getFailedDownloadsByContent();
+    res.json({ ...stats, failedItems });
+  });
+
   app.post('/api/customer/force-sync', requireAuth, async (req: Request, res: Response) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ message: 'Email and password required for sync' });
@@ -1121,6 +1138,201 @@ export async function startServer(port: number): Promise<number> {
       console.log('[force-sync] Sync completed successfully');
     } catch (e: any) {
       console.error('[force-sync] Error:', e.message);
+    }
+  });
+
+  async function safeParseCloudResponse(cloudRes: globalThis.Response): Promise<any> {
+    const text = await cloudRes.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { message: text || `Cloud returned status ${cloudRes.status}` };
+    }
+  }
+
+  function requireOwnerRole(req: Request, res: Response, next: NextFunction) {
+    const sub = getSessionSubscriber(req.session.subscriberId);
+    if (!sub || sub.accountRole !== 'owner') {
+      return res.status(403).json({ message: 'Only the account owner can manage billing' });
+    }
+    next();
+  }
+
+  app.post('/api/customer/checkout', requireAuth, requireOwnerRole, async (req: Request, res: Response) => {
+    try {
+      const syncState = getSyncState();
+      if (!syncState?.hub_token || !syncState?.cloud_url) {
+        return res.status(503).json({ message: 'Not connected to cloud. Please set up cloud sync first.' });
+      }
+
+      const { plan, quantity, currency, billingInterval, returnTo, screenId } = req.body;
+      if (!plan) return res.status(400).json({ message: 'Plan is required' });
+
+      const host = req.get('host') || `localhost:${boundPort}`;
+      const protocol = isRequestSecure(req) ? 'https' : 'http';
+      const localBaseUrl = `${protocol}://${host}`;
+
+      const successUrl = `${localBaseUrl}/customer/checkout/success`;
+      const cancelUrl = `${localBaseUrl}/customer/subscription?payment=cancelled`;
+
+      const cloudRes = await fetch(`${syncState.cloud_url}/api/hub/checkout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-hub-token': syncState.hub_token },
+        body: JSON.stringify({ plan, quantity, currency, billingInterval, returnTo, screenId, successUrl, cancelUrl }),
+      });
+
+      const data = await safeParseCloudResponse(cloudRes);
+      if (!cloudRes.ok) {
+        return res.status(cloudRes.status).json(data);
+      }
+
+      if (data.added || data.free) {
+        if (cloudSync) {
+          cloudSync.syncSubscriptionFirst().catch((e: any) => console.warn('[checkout] Post-purchase sync error:', e.message));
+        }
+      }
+
+      res.json(data);
+    } catch (err: any) {
+      console.error('[checkout-proxy] Error:', err.message);
+      if (err.cause?.code === 'ECONNREFUSED' || err.cause?.code === 'ENOTFOUND' || err.message.includes('fetch failed')) {
+        return res.status(503).json({ message: 'Cannot reach cloud server. Please check your internet connection.' });
+      }
+      res.status(500).json({ message: 'Failed to start checkout' });
+    }
+  });
+
+  app.get('/customer/checkout/success', requireAuth, async (req: Request, res: Response) => {
+    if (cloudSync) {
+      try {
+        await cloudSync.syncSubscriptionFirst();
+        console.log('[checkout-success] Post-purchase sync completed');
+      } catch (e: any) {
+        console.warn('[checkout-success] Sync error:', e.message);
+      }
+    }
+    res.redirect('/customer/subscription?payment=success');
+  });
+
+  app.post('/api/stripe/portal', requireAuth, requireOwnerRole, async (req: Request, res: Response) => {
+    try {
+      const syncState = getSyncState();
+      if (!syncState?.hub_token || !syncState?.cloud_url) {
+        return res.status(503).json({ message: 'Not connected to cloud. Please set up cloud sync first.' });
+      }
+
+      const host = req.get('host') || `localhost:${boundPort}`;
+      const protocol = isRequestSecure(req) ? 'https' : 'http';
+      const localBaseUrl = `${protocol}://${host}`;
+
+      const cloudRes = await fetch(`${syncState.cloud_url}/api/hub/billing-portal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-hub-token': syncState.hub_token },
+        body: JSON.stringify({ returnUrl: `${localBaseUrl}/customer/subscription` }),
+      });
+
+      const data = await safeParseCloudResponse(cloudRes);
+      if (!cloudRes.ok) return res.status(cloudRes.status).json(data);
+      res.json(data);
+    } catch (err: any) {
+      console.error('[billing-portal-proxy] Error:', err.message);
+      if (err.cause?.code === 'ECONNREFUSED' || err.cause?.code === 'ENOTFOUND' || err.message.includes('fetch failed')) {
+        return res.status(503).json({ message: 'Cannot reach cloud server. Please check your internet connection.' });
+      }
+      res.status(500).json({ message: 'Failed to open billing portal' });
+    }
+  });
+
+  app.post('/api/customer/licenses/:id/cancel', requireAuth, requireOwnerRole, async (req: Request, res: Response) => {
+    try {
+      const syncState = getSyncState();
+      if (!syncState?.hub_token || !syncState?.cloud_url) {
+        return res.status(503).json({ message: 'Not connected to cloud. Please set up cloud sync first.' });
+      }
+
+      const licenseId = req.params.id;
+      const cloudRes = await fetch(`${syncState.cloud_url}/api/hub/licenses/${licenseId}/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-hub-token': syncState.hub_token },
+      });
+
+      const data = await safeParseCloudResponse(cloudRes);
+      if (!cloudRes.ok) return res.status(cloudRes.status).json(data);
+
+      if (cloudSync) {
+        cloudSync.syncSubscriptionFirst().catch((e: any) => console.warn('[cancel-proxy] Post-cancel sync error:', e.message));
+      }
+
+      res.json(data);
+    } catch (err: any) {
+      console.error('[cancel-proxy] Error:', err.message);
+      if (err.cause?.code === 'ECONNREFUSED' || err.cause?.code === 'ENOTFOUND' || err.message.includes('fetch failed')) {
+        return res.status(503).json({ message: 'Cannot reach cloud server. Please check your internet connection.' });
+      }
+      res.status(500).json({ message: 'Failed to cancel license' });
+    }
+  });
+
+  app.post('/api/customer/licenses/bulk-cancel', requireAuth, requireOwnerRole, async (req: Request, res: Response) => {
+    try {
+      const syncState = getSyncState();
+      if (!syncState?.hub_token || !syncState?.cloud_url) {
+        return res.status(503).json({ message: 'Not connected to cloud. Please set up cloud sync first.' });
+      }
+
+      const cloudRes = await fetch(`${syncState.cloud_url}/api/hub/licenses/bulk-cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-hub-token': syncState.hub_token },
+        body: JSON.stringify({ licenseIds: req.body.licenseIds }),
+      });
+
+      const data = await safeParseCloudResponse(cloudRes);
+      if (!cloudRes.ok) return res.status(cloudRes.status).json(data);
+
+      if (cloudSync) {
+        cloudSync.syncSubscriptionFirst().catch((e: any) => console.warn('[bulk-cancel-proxy] Post-cancel sync error:', e.message));
+      }
+
+      res.json(data);
+    } catch (err: any) {
+      console.error('[bulk-cancel-proxy] Error:', err.message);
+      if (err.cause?.code === 'ECONNREFUSED' || err.cause?.code === 'ENOTFOUND' || err.message.includes('fetch failed')) {
+        return res.status(503).json({ message: 'Cannot reach cloud server. Please check your internet connection.' });
+      }
+      res.status(500).json({ message: 'Failed to cancel licenses' });
+    }
+  });
+
+  app.post('/api/customer/subscription-groups/:id/adjust', requireAuth, requireOwnerRole, async (req: Request, res: Response) => {
+    try {
+      const syncState = getSyncState();
+      if (!syncState?.hub_token || !syncState?.cloud_url) {
+        return res.status(503).json({ message: 'Not connected to cloud. Please set up cloud sync first.' });
+      }
+
+      const groupId = req.params.id;
+      const { quantity } = req.body;
+
+      const cloudRes = await fetch(`${syncState.cloud_url}/api/hub/subscription-groups/${groupId}/adjust`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-hub-token': syncState.hub_token },
+        body: JSON.stringify({ quantity }),
+      });
+
+      const data = await safeParseCloudResponse(cloudRes);
+      if (!cloudRes.ok) return res.status(cloudRes.status).json(data);
+
+      if (cloudSync) {
+        cloudSync.syncSubscriptionFirst().catch((e: any) => console.warn('[adjust-proxy] Post-adjust sync error:', e.message));
+      }
+
+      res.json(data);
+    } catch (err: any) {
+      console.error('[adjust-proxy] Error:', err.message);
+      if (err.cause?.code === 'ECONNREFUSED' || err.cause?.code === 'ENOTFOUND' || err.message.includes('fetch failed')) {
+        return res.status(503).json({ message: 'Cannot reach cloud server. Please check your internet connection.' });
+      }
+      res.status(500).json({ message: 'Failed to adjust subscription' });
     }
   });
 

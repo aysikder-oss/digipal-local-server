@@ -25,6 +25,8 @@ import {
   logSyncConflict,
 } from '../db/sqlite';
 import { broadcastToPlayers } from './player-bus';
+import { broadcastToDashboard } from './dashboard-bus';
+import { queueContentMediaDownloads, queueDesignTemplateMediaDownloads, scanAndQueueAllCloudContent } from './media-downloader';
 
 const STANDARD_SYNC_INTERVAL = 60 * 60 * 1000;
 const LAZY_SYNC_INTERVAL = 24 * 60 * 60 * 1000;
@@ -297,6 +299,7 @@ export class CloudSync {
       }
 
       case 'forceSyncNow':
+        console.log('[cloud-sync] Received forceSyncNow — performing immediate full sync');
         this.syncSubscriptionFirst().catch(() => {}).then(() => {
           this.pullChanges(['realtime', 'standard', 'lazy']);
           this.pushChanges();
@@ -690,13 +693,45 @@ export class CloudSync {
 
     console.log(`[cloud-sync] Applied ${applied}/${changes.length} changes`);
 
-    const hasLicenseRelatedChanges = changes.some(
-      (c) => c.tableName === 'licenses' || (c.tableName === 'screens' && (c.data?.license_status || c.payload?.license_status))
-    );
-    if (hasLicenseRelatedChanges) {
-      console.log('[cloud-sync] License-related changes detected — reconciling and enforcing free screen limit');
-      reconcileScreenLicenseStatuses();
-      enforceLocalFreeScreenLimit();
+    if (applied > 0) {
+      const changedTables = new Set(changes.map((c) => c.tableName).filter(Boolean));
+
+      const hasLicenseChanges = changedTables.has('licenses') || changedTables.has('subscription_groups');
+      const hasScreenChanges = changedTables.has('screens');
+
+      if (hasLicenseChanges || hasScreenChanges) {
+        console.log('[cloud-sync] License/screen changes detected — reconciling and enforcing free screen limit');
+        reconcileScreenLicenseStatuses();
+        enforceLocalFreeScreenLimit();
+      }
+
+      if (hasLicenseChanges) {
+        broadcastToDashboard({ type: 'licensesChanged', payload: {} });
+      }
+      if (hasScreenChanges) {
+        broadcastToDashboard({ type: 'screensChanged', payload: {} });
+      }
+
+      if (changedTables.has('contents') || changedTables.has('design_templates')) {
+        let queued = 0;
+        const contentChanges = changes.filter(c => c.tableName === 'contents' && c.operation !== 'DELETE');
+        for (const change of contentChanges) {
+          const recordId = change.data?.id || change.recordId;
+          if (recordId) {
+            queued += queueContentMediaDownloads(recordId);
+          }
+        }
+        const templateChanges = changes.filter(c => c.tableName === 'design_templates' && c.operation !== 'DELETE');
+        for (const change of templateChanges) {
+          const recordId = change.data?.id || change.recordId;
+          if (recordId) {
+            queued += queueDesignTemplateMediaDownloads(recordId);
+          }
+        }
+        if (queued > 0) {
+          console.log(`[cloud-sync] Queued ${queued} media downloads for synced content/templates`);
+        }
+      }
     }
   }
 
@@ -788,6 +823,7 @@ export class CloudSync {
 
       reconcileScreenLicenseStatuses();
       enforceLocalFreeScreenLimit();
+      broadcastToDashboard({ type: 'licensesChanged', payload: {} });
       console.log('[cloud-sync] Priority subscription sync complete');
     } catch (e: any) {
       console.error('[cloud-sync] Subscription sync failed:', e.message);

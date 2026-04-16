@@ -1105,6 +1105,22 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_error_logs_sent ON error_logs(sent_to_cloud) WHERE sent_to_cloud = 0;
     CREATE INDEX IF NOT EXISTS idx_error_logs_timestamp ON error_logs(timestamp);
 
+    CREATE TABLE IF NOT EXISTS media_downloads (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      object_path TEXT NOT NULL UNIQUE,
+      local_filename TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      content_id INTEGER,
+      field TEXT NOT NULL DEFAULT 'data',
+      file_size INTEGER,
+      retry_count INTEGER DEFAULT 0,
+      error TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_media_downloads_status ON media_downloads(status);
+    CREATE INDEX IF NOT EXISTS idx_media_downloads_object_path ON media_downloads(object_path);
+
     CREATE TABLE IF NOT EXISTS sync_conflicts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       table_name TEXT NOT NULL,
