@@ -10,6 +10,7 @@ import { getDb, getSyncState, updateSyncState, isHubRevoked, isScreenAllowedToPl
 import { startMdns, stopMdns, scanForExistingHubs, getMdnsStatus } from './mdns';
 import { CloudSync } from './cloud-sync';
 import { getConnectedPlayers, registerPlayer, unregisterPlayer, broadcastToPlayers } from './player-bus';
+import { registerDashboardClient, unregisterDashboardClient, broadcastToDashboard } from './dashboard-bus';
 import { SqliteStorage, rowsToCamel, rowToCamel } from '../db/sqlite-storage';
 import { authenticateUser, getSessionSubscriber, initSessionTable, createSession, getSession, deleteSession, cleanExpiredSessions } from './auth';
 import { saveUploadedFile, getMediaDir, getMediaDiskUsage, deleteLocalFile, generateThumbnailBase64, generateVideoThumbnailBase64, isVideoFile } from './file-storage';
@@ -24,6 +25,7 @@ let hubBlocked = false;
 let discoveredHubs: Array<{ name: string; host: string; port: number }> = [];
 let boundPort: number = parseInt(String(process.env.LOCAL_PORT || 8787));
 let sessionCleanupInterval: NodeJS.Timeout | null = null;
+let staleScreenCleanupInterval: NodeJS.Timeout | null = null;
 const storage = new SqliteStorage();
 
 let initialSyncStatus: { inProgress: boolean; step: string; error: string | null; completedAt: string | null } = {
@@ -2758,6 +2760,8 @@ export async function startServer(port: number): Promise<number> {
       }
 
       res.json(camelScreen);
+      broadcastToDashboard({ type: 'screenStatusChanged', payload: { screenId: screen.id, isOnline: true } });
+      broadcastToDashboard({ type: 'licensesChanged', payload: {} });
       if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) {
       console.error('[route] POST /api/customer/screens/pair error:', e);
@@ -2795,6 +2799,8 @@ export async function startServer(port: number): Promise<number> {
 
       const updated = await storage.assignLicenseToScreen(license.id, screen.id);
       res.json(updated);
+      broadcastToDashboard({ type: 'screenStatusChanged', payload: { screenId: screen.id } });
+      broadcastToDashboard({ type: 'licensesChanged', payload: {} });
       if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) {
       console.error('[route] POST /api/customer/licenses/:id/assign error:', e);
@@ -2814,6 +2820,8 @@ export async function startServer(port: number): Promise<number> {
 
       const updated = await storage.unassignLicenseFromScreen(license.id);
       res.json(updated);
+      broadcastToDashboard({ type: 'screenStatusChanged', payload: { screenId: license.screenId } });
+      broadcastToDashboard({ type: 'licensesChanged', payload: {} });
     } catch (e: any) {
       console.error('[route] POST /api/licenses/:id/unassign error:', e);
       res.status(500).json({ message: e.message });
@@ -2856,6 +2864,7 @@ export async function startServer(port: number): Promise<number> {
       }
 
       res.json(screen);
+      broadcastToDashboard({ type: 'screenStatusChanged', payload: { screenId: Number(req.params.id) } });
       if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
@@ -2918,6 +2927,7 @@ export async function startServer(port: number): Promise<number> {
       }
 
       res.json(screen);
+      broadcastToDashboard({ type: 'screenStatusChanged', payload: { screenId: Number(req.params.id) } });
       if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
@@ -2942,8 +2952,15 @@ export async function startServer(port: number): Promise<number> {
 
   app.delete('/api/screens/:id', requireAuth, requirePermission('screens.delete'), requireOwnership('screens'), async (req: Request, res: Response) => {
     try {
-      await storage.deleteScreen(Number(req.params.id));
+      const screenId = Number(req.params.id);
+      const license = await storage.getLicenseByScreenId(screenId);
+      if (license) {
+        await storage.unassignLicenseFromScreen(license.id);
+      }
+      await storage.deleteScreen(screenId);
       res.json({ ok: true });
+      broadcastToDashboard({ type: 'screenStatusChanged', payload: { screenId, deleted: true } });
+      broadcastToDashboard({ type: 'licensesChanged', payload: {} });
       if (cloudSync?.isConnected()) cloudSync.triggerForceSync();
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
@@ -4585,6 +4602,8 @@ export async function startServer(port: number): Promise<number> {
   app.post('/api/screen/:pairingCode/heartbeat', (req: Request, res: Response) => {
     const db = getDb();
     const { platform, model, osVersion, appVersion, resolution } = req.body;
+    const pairingCode = req.params.pairingCode;
+    const screen = db.prepare('SELECT id, is_online FROM screens WHERE pairing_code = ?').get(pairingCode) as any;
     db.prepare(`
       UPDATE screens SET
         platform = COALESCE(?, platform),
@@ -4597,7 +4616,14 @@ export async function startServer(port: number): Promise<number> {
         last_heartbeat = datetime('now'),
         last_ping_at = datetime('now')
       WHERE pairing_code = ?
-    `).run(platform, model, osVersion, appVersion, resolution, req.params.pairingCode);
+    `).run(platform, model, osVersion, appVersion, resolution, pairingCode);
+    if (screen) {
+      if (!screen.is_online) {
+        broadcastToDashboard({ type: 'screenOnline', payload: { pairingCode, screenId: screen.id } });
+        broadcastToDashboard({ type: 'screenStatusChanged', payload: { screenId: screen.id, isOnline: true } });
+      }
+      broadcastToDashboard({ type: 'screenHeartbeat', payload: { pairingCode, screenId: screen.id } });
+    }
     res.json({ status: 'ok' });
   });
 
@@ -4731,22 +4757,68 @@ export async function startServer(port: number): Promise<number> {
   server = http.createServer(app);
 
   wss = new WebSocketServer({ server });
-  wss.on('connection', (ws, _req) => {
+  wss.on('connection', (ws, req) => {
     let playerCode: string | null = null;
+    let isDashboardClient = false;
+
+    const cookieHeader = req.headers.cookie || '';
+    const sessionCookie = cookieHeader.split(';').map(c => c.trim()).find(c => c.startsWith('session='));
+    const sessionId = sessionCookie ? sessionCookie.split('=')[1] : null;
+    const wsSession = sessionId ? getSession(sessionId) : null;
 
     ws.on('message', (raw) => {
       try {
         const data = JSON.parse(raw.toString());
+
+        if (data.type === 'customerIdentify' || data.type === 'adminIdentify') {
+          if (wsSession) {
+            isDashboardClient = true;
+            registerDashboardClient(ws);
+          }
+        }
 
         if (data.type === 'tvIdentify') {
           playerCode = data.payload?.pairingCode;
           if (playerCode) {
             registerPlayer(playerCode, ws);
             const db = getDb();
-            const screen = db.prepare('SELECT id FROM screens WHERE pairing_code = ?').get(playerCode) as any;
-            if (screen) { (ws as any)._screenId = screen.id; }
+            const screen = db.prepare('SELECT id, is_online FROM screens WHERE pairing_code = ?').get(playerCode) as any;
+            if (screen) {
+              (ws as any)._screenId = screen.id;
+              if (!screen.is_online) {
+                db.prepare("UPDATE screens SET is_online = 1, last_seen_at = datetime('now') WHERE id = ?").run(screen.id);
+              }
+              broadcastToDashboard({ type: 'screenOnline', payload: { pairingCode: playerCode, screenId: screen.id } });
+              broadcastToDashboard({ type: 'screenStatusChanged', payload: { screenId: screen.id, isOnline: true } });
+            }
             ws.send(JSON.stringify({ type: 'tvConnected', payload: { pairingCode: playerCode } }));
           }
+        }
+
+        if (data.type === 'heartbeat' && playerCode) {
+          const db = getDb();
+          const screenId = (ws as any)._screenId;
+          if (screenId) {
+            db.prepare(`
+              UPDATE screens SET
+                is_online = 1,
+                last_seen_at = datetime('now'),
+                last_heartbeat = datetime('now'),
+                last_ping_at = datetime('now')
+              WHERE id = ?
+            `).run(screenId);
+            broadcastToDashboard({ type: 'screenHeartbeat', payload: { pairingCode: playerCode, screenId } });
+          }
+        }
+
+        if (data.type === 'timeSync' && data.payload?.clientSendTime) {
+          ws.send(JSON.stringify({
+            type: 'timeSyncResponse',
+            payload: {
+              clientSendTime: data.payload.clientSendTime,
+              serverTime: Date.now(),
+            },
+          }));
         }
 
         if (data.type === 'commandAck' && data.payload?.commandId) {
@@ -4762,13 +4834,40 @@ export async function startServer(port: number): Promise<number> {
     });
 
     ws.on('close', () => {
+      if (isDashboardClient) {
+        unregisterDashboardClient(ws);
+      }
       if (playerCode) {
         unregisterPlayer(playerCode);
         const db = getDb();
+        const screen = db.prepare('SELECT id FROM screens WHERE pairing_code = ?').get(playerCode) as any;
         db.prepare("UPDATE screens SET is_online = 0 WHERE pairing_code = ?").run(playerCode);
+        if (screen) {
+          broadcastToDashboard({ type: 'screenOffline', payload: { pairingCode: playerCode, screenId: screen.id } });
+          broadcastToDashboard({ type: 'screenStatusChanged', payload: { screenId: screen.id, isOnline: false } });
+        }
       }
     });
   });
+
+  staleScreenCleanupInterval = setInterval(() => {
+    try {
+      const db = getDb();
+      const staleScreens = db.prepare(`
+        SELECT id, pairing_code FROM screens 
+        WHERE is_online = 1 
+        AND last_heartbeat IS NOT NULL 
+        AND (julianday('now') - julianday(last_heartbeat)) * 86400 > 60
+      `).all() as any[];
+      for (const screen of staleScreens) {
+        db.prepare("UPDATE screens SET is_online = 0 WHERE id = ?").run(screen.id);
+        broadcastToDashboard({ type: 'screenOffline', payload: { pairingCode: screen.pairing_code, screenId: screen.id } });
+        broadcastToDashboard({ type: 'screenStatusChanged', payload: { screenId: screen.id, isOnline: false } });
+      }
+    } catch (e) {
+      console.error('[stale-screen-cleanup] error:', e);
+    }
+  }, 30000);
 
   return new Promise((resolve, reject) => {
     const onListening = () => {
@@ -4824,6 +4923,7 @@ export async function startServer(port: number): Promise<number> {
 
 export async function stopServer(): Promise<void> {
   if (sessionCleanupInterval) { clearInterval(sessionCleanupInterval); sessionCleanupInterval = null; }
+  if (staleScreenCleanupInterval) { clearInterval(staleScreenCleanupInterval); staleScreenCleanupInterval = null; }
   stopMdns();
   cloudSync?.stop();
 
@@ -4849,3 +4949,4 @@ export async function stopServer(): Promise<void> {
 }
 
 export { getConnectedPlayers, broadcastToPlayers } from './player-bus';
+export { broadcastToDashboard } from './dashboard-bus';
