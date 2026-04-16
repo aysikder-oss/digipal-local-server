@@ -26,7 +26,7 @@ import {
 } from '../db/sqlite';
 import { broadcastToPlayers } from './player-bus';
 import { broadcastToDashboard } from './dashboard-bus';
-import { queueContentMediaDownloads, queueDesignTemplateMediaDownloads, scanAndQueueAllCloudContent } from './media-downloader';
+import { queueContentMediaDownloads, queueDesignTemplateMediaDownloads, queueKioskMediaDownloads, scanAndQueueAllCloudContent } from './media-downloader';
 
 const STANDARD_SYNC_INTERVAL = 60 * 60 * 1000;
 const LAZY_SYNC_INTERVAL = 24 * 60 * 60 * 1000;
@@ -712,7 +712,7 @@ export class CloudSync {
         broadcastToDashboard({ type: 'screensChanged', payload: {} });
       }
 
-      if (changedTables.has('contents') || changedTables.has('design_templates')) {
+      if (changedTables.has('contents') || changedTables.has('design_templates') || changedTables.has('kiosks')) {
         let queued = 0;
         const contentChanges = changes.filter(c => c.tableName === 'contents' && c.operation !== 'DELETE');
         for (const change of contentChanges) {
@@ -728,8 +728,15 @@ export class CloudSync {
             queued += queueDesignTemplateMediaDownloads(recordId);
           }
         }
+        const kioskChanges = changes.filter(c => c.tableName === 'kiosks' && c.operation !== 'DELETE');
+        for (const change of kioskChanges) {
+          const recordId = change.data?.id || change.recordId;
+          if (recordId) {
+            queued += queueKioskMediaDownloads(recordId);
+          }
+        }
         if (queued > 0) {
-          console.log(`[cloud-sync] Queued ${queued} media downloads for synced content/templates`);
+          console.log(`[cloud-sync] Queued ${queued} media downloads for synced content/templates/kiosks`);
         }
       }
     }

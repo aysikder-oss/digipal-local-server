@@ -138,10 +138,31 @@ function extractCanvasMediaPaths(canvasData: any): string[] {
     for (const element of page.elements) {
       tryNormalize(element.properties?.imageUrl);
       tryNormalize(element.properties?.videoUrl);
+      tryNormalize(element.properties?.pdfUrl);
       tryNormalize(element.properties?.src);
     }
   }
   return paths;
+}
+
+export function queueKioskMediaDownloads(kioskId: number): number {
+  const db = getDb();
+  const kiosk = db.prepare('SELECT * FROM kiosks WHERE id = ?').get(kioskId) as any;
+  if (!kiosk) return 0;
+
+  let queued = 0;
+
+  if (kiosk.data && typeof kiosk.data === 'string') {
+    try {
+      const data = JSON.parse(kiosk.data);
+      const mediaPaths = extractCanvasMediaPaths(data);
+      for (const mediaPath of mediaPaths) {
+        if (queueMediaDownload(mediaPath, kioskId, 'kiosk_data')) queued++;
+      }
+    } catch {}
+  }
+
+  return queued;
 }
 
 export function scanAndQueueAllCloudContent(): number {
@@ -160,8 +181,15 @@ export function scanAndQueueAllCloudContent(): number {
     }
   } catch {}
 
+  try {
+    const kiosks = db.prepare(`SELECT id FROM kiosks WHERE data LIKE '%/objects/%'`).all() as any[];
+    for (const kiosk of kiosks) {
+      totalQueued += queueKioskMediaDownloads(kiosk.id);
+    }
+  } catch {}
+
   if (totalQueued > 0) {
-    console.log(`[media-dl] Scanned all content + templates — queued ${totalQueued} media downloads`);
+    console.log(`[media-dl] Scanned all content + templates + kiosks — queued ${totalQueued} media downloads`);
   }
   return totalQueued;
 }
@@ -281,7 +309,7 @@ function rewriteCanvasDataStructurally(canvasJson: string, objectPath: string, l
       if (!page.elements) continue;
       for (const el of page.elements) {
         if (!el.properties) continue;
-        for (const key of ['imageUrl', 'videoUrl', 'src']) {
+        for (const key of ['imageUrl', 'videoUrl', 'pdfUrl', 'src']) {
           if (el.properties[key]) {
             const norm = normalizeToObjectPath(el.properties[key]);
             if (norm === objectPath) { el.properties[key] = localUrl; changed = true; }
@@ -333,6 +361,14 @@ function rewriteAllReferences(objectPath: string, localUrl: string) {
       const updated = rewriteCanvasDataStructurally(row.canvas_data, objectPath, localUrl);
       if (updated) db.prepare('UPDATE design_templates SET canvas_data = ? WHERE id = ?').run(updated, row.id);
     }
+
+    try {
+      const kioskRows = db.prepare("SELECT id, data FROM kiosks WHERE data LIKE ?").all(`%${objectPath}%`) as any[];
+      for (const row of kioskRows) {
+        const updated = rewriteCanvasDataStructurally(row.data, objectPath, localUrl);
+        if (updated) db.prepare('UPDATE kiosks SET data = ? WHERE id = ?').run(updated, row.id);
+      }
+    } catch {}
   });
 }
 

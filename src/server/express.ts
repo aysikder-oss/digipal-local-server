@@ -2139,13 +2139,34 @@ export async function startServer(port: number): Promise<number> {
 
       const db = getDb();
       const licenses = db.prepare(
-        "SELECT plan_tier FROM licenses WHERE subscriber_id = ? AND status IN ('active', 'canceling', 'trial')"
+        "SELECT plan_tier FROM licenses WHERE subscriber_id = ? AND status IN ('active', 'trial', 'canceling')"
       ).all(req.session.subscriberId) as Array<{ plan_tier: string }>;
+
+      let customPlanStorage: Record<string, number> = {};
+      try {
+        const cpExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='custom_plans'").get();
+        if (cpExists) {
+          const cpCols = (db.prepare("PRAGMA table_info(custom_plans)").all() as Array<{ name: string }>).map(c => c.name);
+          if (cpCols.includes('storage_per_license_mb')) {
+            const cps = db.prepare('SELECT id, storage_per_license_mb FROM custom_plans').all() as Array<{ id: number; storage_per_license_mb: number | null }>;
+            for (const cp of cps) {
+              customPlanStorage[`custom_${cp.id}`] = cp.storage_per_license_mb || DEFAULT_STORAGE_PER_LICENSE_MB;
+            }
+          }
+        }
+      } catch {}
+
+      function storageForTier(tier: string): number {
+        if (tier.startsWith('custom_')) {
+          return customPlanStorage[tier] || DEFAULT_STORAGE_PER_LICENSE_MB;
+        }
+        return PLAN_STORAGE_PER_LICENSE_MB[tier] || DEFAULT_STORAGE_PER_LICENSE_MB;
+      }
 
       let totalMb: number;
       let licenseCount: number;
       if (licenses.length > 0) {
-        totalMb = licenses.reduce((sum, l) => sum + (PLAN_STORAGE_PER_LICENSE_MB[l.plan_tier] || DEFAULT_STORAGE_PER_LICENSE_MB), 0);
+        totalMb = licenses.reduce((sum, l) => sum + storageForTier(l.plan_tier), 0);
         licenseCount = licenses.length;
       } else {
         totalMb = DEFAULT_STORAGE_PER_LICENSE_MB;
