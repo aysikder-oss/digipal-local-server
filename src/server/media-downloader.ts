@@ -1,16 +1,48 @@
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import { getDb, getSyncState, insertErrorLog, withoutTriggers } from '../db/sqlite';
+import { getDb, getSyncState, insertErrorLog, withoutTriggers, getConfig, setConfig } from '../db/sqlite';
 import { getMediaDir } from './file-storage';
 
-const MAX_CONCURRENT = 3;
+const DEFAULT_MAX_CONCURRENT = 6;
+const MAX_CONCURRENT_HARD_CAP = 32;
 const MAX_RETRIES = 3;
 const PROCESS_INTERVAL_MS = 5_000;
+const PARTIAL_EXT = '.partial';
 
 let processing = false;
 let processTimer: NodeJS.Timeout | null = null;
 let isRunning = false;
+
+/**
+ * Tables and columns that may contain media references (either as plain
+ * `/objects/<path>` strings or embedded inside JSON blobs).
+ *
+ * We avoid hard-coding individual JSON field names (backgroundImage, imageUrl,
+ * videoUrl, etc.) — instead the rewrite/scan walkers crawl the parsed JSON
+ * tree and match any string that resolves to an `/objects/` path. This way a
+ * new field added on the cloud side keeps working without a hub rebuild.
+ *
+ * `kind: 'scalar'` means the column holds a single URL string.
+ * `kind: 'json'` means the column holds a JSON document we should walk.
+ * `kind: 'auto'` means the column may be either — we try JSON first, fall
+ * back to scalar matching.
+ */
+type ColumnKind = 'scalar' | 'json' | 'auto';
+interface MediaColumn { table: string; column: string; kind: ColumnKind }
+
+const MEDIA_COLUMNS: MediaColumn[] = [
+  { table: 'contents',         column: 'data',          kind: 'auto'   },
+  { table: 'contents',         column: 'url',           kind: 'scalar' },
+  { table: 'contents',         column: 'thumbnail_url', kind: 'scalar' },
+  { table: 'contents',         column: 'canvas_data',   kind: 'json'   },
+  { table: 'contents',         column: 'settings',      kind: 'json'   },
+  { table: 'design_templates', column: 'thumbnail_url', kind: 'scalar' },
+  { table: 'design_templates', column: 'canvas_data',   kind: 'json'   },
+  { table: 'kiosks',           column: 'data',          kind: 'json'   },
+  { table: 'kiosks',           column: 'settings',      kind: 'json'   },
+  { table: 'playlists',        column: 'data',          kind: 'json'   },
+];
 
 export function startMediaDownloader() {
   if (isRunning) return;
@@ -18,9 +50,21 @@ export function startMediaDownloader() {
   console.log('[media-dl] Media downloader started');
 
   const db = getDb();
+
+  // Re-arm any rows left in 'downloading' on a prior crash. We do NOT reset
+  // bytes_downloaded — the partial file on disk will let us resume via
+  // HTTP Range on the next attempt.
   const staleCount = db.prepare("UPDATE media_downloads SET status = 'pending' WHERE status = 'downloading'").run().changes;
   if (staleCount > 0) {
-    console.log(`[media-dl] Reset ${staleCount} stale downloading entries to pending`);
+    console.log(`[media-dl] Reset ${staleCount} stale downloading entries to pending (will resume from byte offset)`);
+  }
+
+  // Backfill: completed rows whose local file has gone missing (manual
+  // delete, disk corruption, profile move) get re-queued so the next
+  // process tick re-fetches them.
+  const reQueued = backfillMissingLocalFiles();
+  if (reQueued > 0) {
+    console.log(`[media-dl] Backfill: re-queued ${reQueued} downloads whose local files were missing`);
   }
 
   processTimer = setInterval(() => processQueue(), PROCESS_INTERVAL_MS);
@@ -34,6 +78,114 @@ export function stopMediaDownloader() {
     processTimer = null;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Concurrency
+// ---------------------------------------------------------------------------
+
+const CONFIG_KEY_CONCURRENCY = 'media_downloader_concurrency';
+
+export function getMediaDownloaderConcurrency(): number {
+  const raw = getConfig(CONFIG_KEY_CONCURRENCY);
+  if (!raw) return DEFAULT_MAX_CONCURRENT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_CONCURRENT;
+  return Math.min(Math.floor(n), MAX_CONCURRENT_HARD_CAP);
+}
+
+export function setMediaDownloaderConcurrency(value: number): number {
+  if (!Number.isFinite(value) || value < 1) {
+    throw new Error('Concurrency must be a positive integer');
+  }
+  const clamped = Math.min(Math.floor(value), MAX_CONCURRENT_HARD_CAP);
+  setConfig(CONFIG_KEY_CONCURRENCY, String(clamped));
+  return clamped;
+}
+
+// ---------------------------------------------------------------------------
+// URL normalization + JSON walker
+// ---------------------------------------------------------------------------
+
+function normalizeToObjectPath(value: string): string | null {
+  if (typeof value !== 'string' || value.length === 0) return null;
+  if (value.startsWith('/objects/')) return value;
+  try {
+    const url = new URL(value);
+    const objectsIdx = url.pathname.indexOf('/objects/');
+    if (objectsIdx !== -1) return url.pathname.slice(objectsIdx);
+  } catch { /* not a URL */ }
+  return null;
+}
+
+/**
+ * Walk an arbitrary JSON-like value and collect every string that resolves
+ * to an `/objects/...` reference.
+ */
+function walkCollectObjectPaths(node: any, out: Set<string>): void {
+  if (node == null) return;
+  if (typeof node === 'string') {
+    const norm = normalizeToObjectPath(node);
+    if (norm) out.add(norm);
+    return;
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) walkCollectObjectPaths(item, out);
+    return;
+  }
+  if (typeof node === 'object') {
+    for (const key of Object.keys(node)) walkCollectObjectPaths(node[key], out);
+  }
+}
+
+/**
+ * Walk and rewrite any string in the tree matching `oldRef` to `newRef`.
+ * - When `oldRef` is a `/objects/...` path, we match by normalized object path
+ *   so absolute https://... URLs that embed the same path are also rewritten.
+ * - Otherwise we match by exact string equality (used for /media/<file>
+ *   re-rewrite during backfill).
+ *
+ * Mutates the tree in place. Returns whether anything changed.
+ */
+function walkRewriteString(s: string, oldRef: string, newRef: string): string | null {
+  if (s === oldRef) return newRef;
+  if (oldRef.startsWith('/objects/')) {
+    const norm = normalizeToObjectPath(s);
+    if (norm === oldRef) return newRef;
+  }
+  return null;
+}
+
+function walkRewrite(node: any, oldRef: string, newRef: string): { value: any; changed: boolean } {
+  if (typeof node === 'string') {
+    const r = walkRewriteString(node, oldRef, newRef);
+    if (r !== null) return { value: r, changed: true };
+    return { value: node, changed: false };
+  }
+  if (Array.isArray(node)) {
+    let changed = false;
+    for (let i = 0; i < node.length; i++) {
+      const r = walkRewrite(node[i], oldRef, newRef);
+      if (r.changed) { node[i] = r.value; changed = true; }
+    }
+    return { value: node, changed };
+  }
+  if (node && typeof node === 'object') {
+    let changed = false;
+    for (const k of Object.keys(node)) {
+      const r = walkRewrite(node[k], oldRef, newRef);
+      if (r.changed) { node[k] = r.value; changed = true; }
+    }
+    return { value: node, changed };
+  }
+  return { value: node, changed: false };
+}
+
+/** Exposed for unit testing the schema-aware traversal. */
+export const __testing__ = { normalizeToObjectPath, walkCollectObjectPaths, walkRewrite };
+
+// ---------------------------------------------------------------------------
+// Queueing
+// ---------------------------------------------------------------------------
 
 export function queueMediaDownload(objectPath: string, contentId: number, field: string = 'data'): boolean {
   if (!objectPath || !objectPath.startsWith('/objects/')) return false;
@@ -54,19 +206,9 @@ export function queueMediaDownload(objectPath: string, contentId: number, field:
     return false;
   }
 
-  db.prepare('INSERT INTO media_downloads (object_path, content_id, field, status) VALUES (?, ?, ?, ?)')
+  db.prepare('INSERT INTO media_downloads (object_path, content_id, field, status, bytes_downloaded) VALUES (?, ?, ?, ?, 0)')
     .run(objectPath, contentId, field, 'pending');
   return true;
-}
-
-function normalizeToObjectPath(value: string): string | null {
-  if (value.startsWith('/objects/')) return value;
-  try {
-    const url = new URL(value);
-    const objectsIdx = url.pathname.indexOf('/objects/');
-    if (objectsIdx !== -1) return url.pathname.slice(objectsIdx);
-  } catch {}
-  return null;
 }
 
 function tryQueueField(value: string | undefined | null, contentId: number, field: string): boolean {
@@ -76,27 +218,32 @@ function tryQueueField(value: string | undefined | null, contentId: number, fiel
   return queueMediaDownload(objectPath, contentId, field);
 }
 
+function queueAllPathsFromJson(jsonText: string | null | undefined, recordId: number, field: string): number {
+  if (!jsonText || typeof jsonText !== 'string') return 0;
+  let parsed: any;
+  try { parsed = JSON.parse(jsonText); } catch { return 0; }
+  const paths = new Set<string>();
+  walkCollectObjectPaths(parsed, paths);
+  let queued = 0;
+  for (const p of paths) {
+    if (queueMediaDownload(p, recordId, field)) queued++;
+  }
+  return queued;
+}
+
 export function queueContentMediaDownloads(contentId: number): number {
   const db = getDb();
   const content = db.prepare('SELECT * FROM contents WHERE id = ?').get(contentId) as any;
   if (!content) return 0;
 
   let queued = 0;
-
   if (tryQueueField(content.data, contentId, 'data')) queued++;
   if (tryQueueField(content.url, contentId, 'url')) queued++;
   if (tryQueueField(content.thumbnail_url, contentId, 'thumbnail_url')) queued++;
-
-  if (content.canvas_data && typeof content.canvas_data === 'string') {
-    try {
-      const canvasData = JSON.parse(content.canvas_data);
-      const mediaPaths = extractCanvasMediaPaths(canvasData);
-      for (const mediaPath of mediaPaths) {
-        if (queueMediaDownload(mediaPath, contentId, 'canvas_data')) queued++;
-      }
-    } catch {}
-  }
-
+  queued += queueAllPathsFromJson(content.canvas_data, contentId, 'canvas_data');
+  queued += queueAllPathsFromJson(content.settings, contentId, 'settings');
+  // `data` may itself be JSON (rich content). Try as JSON too — duplicates are ignored.
+  queued += queueAllPathsFromJson(content.data, contentId, 'data');
   return queued;
 }
 
@@ -106,43 +253,9 @@ export function queueDesignTemplateMediaDownloads(templateId: number): number {
   if (!template) return 0;
 
   let queued = 0;
-
   if (tryQueueField(template.thumbnail_url, templateId, 'dt_thumbnail_url')) queued++;
-
-  if (template.canvas_data && typeof template.canvas_data === 'string') {
-    try {
-      const canvasData = JSON.parse(template.canvas_data);
-      const imagePaths = extractCanvasMediaPaths(canvasData);
-      for (const imgPath of imagePaths) {
-        if (queueMediaDownload(imgPath, templateId, 'dt_canvas_data')) queued++;
-      }
-    } catch {}
-  }
-
+  queued += queueAllPathsFromJson(template.canvas_data, templateId, 'dt_canvas_data');
   return queued;
-}
-
-function extractCanvasMediaPaths(canvasData: any): string[] {
-  const paths: string[] = [];
-  if (!canvasData || !canvasData.pages) return paths;
-
-  function tryNormalize(value: any): void {
-    if (typeof value !== 'string') return;
-    const normalized = normalizeToObjectPath(value);
-    if (normalized) paths.push(normalized);
-  }
-
-  for (const page of canvasData.pages) {
-    tryNormalize(page.backgroundImage);
-    if (!page.elements) continue;
-    for (const element of page.elements) {
-      tryNormalize(element.properties?.imageUrl);
-      tryNormalize(element.properties?.videoUrl);
-      tryNormalize(element.properties?.pdfUrl);
-      tryNormalize(element.properties?.src);
-    }
-  }
-  return paths;
 }
 
 export function queueKioskMediaDownloads(kioskId: number): number {
@@ -151,17 +264,8 @@ export function queueKioskMediaDownloads(kioskId: number): number {
   if (!kiosk) return 0;
 
   let queued = 0;
-
-  if (kiosk.data && typeof kiosk.data === 'string') {
-    try {
-      const data = JSON.parse(kiosk.data);
-      const mediaPaths = extractCanvasMediaPaths(data);
-      for (const mediaPath of mediaPaths) {
-        if (queueMediaDownload(mediaPath, kioskId, 'kiosk_data')) queued++;
-      }
-    } catch {}
-  }
-
+  queued += queueAllPathsFromJson(kiosk.data, kioskId, 'kiosk_data');
+  queued += queueAllPathsFromJson(kiosk.settings, kioskId, 'kiosk_settings');
   return queued;
 }
 
@@ -169,30 +273,86 @@ export function scanAndQueueAllCloudContent(): number {
   const db = getDb();
   let totalQueued = 0;
 
-  const contents = db.prepare(`SELECT id FROM contents WHERE data LIKE '/objects/%' OR data LIKE '%/objects/%' OR url LIKE '/objects/%' OR url LIKE '%/objects/%' OR thumbnail_url LIKE '/objects/%' OR thumbnail_url LIKE '%/objects/%' OR canvas_data LIKE '%/objects/%'`).all() as any[];
-  for (const content of contents) {
-    totalQueued += queueContentMediaDownloads(content.id);
+  for (const { table, column, kind } of MEDIA_COLUMNS) {
+    let rows: any[] = [];
+    try {
+      rows = db.prepare(`SELECT id, ${column} AS v FROM ${table} WHERE ${column} LIKE '%/objects/%'`).all() as any[];
+    } catch {
+      continue; // table or column may not exist on older DBs
+    }
+    for (const row of rows) {
+      if (!row.v) continue;
+      if (kind === 'scalar') {
+        if (tryQueueField(row.v, row.id, `${table}.${column}`)) totalQueued++;
+      } else if (kind === 'json') {
+        totalQueued += queueAllPathsFromJson(row.v, row.id, `${table}.${column}`);
+      } else {
+        // auto: try JSON, then fall back to scalar
+        const before = totalQueued;
+        totalQueued += queueAllPathsFromJson(row.v, row.id, `${table}.${column}`);
+        if (totalQueued === before) {
+          if (tryQueueField(row.v, row.id, `${table}.${column}`)) totalQueued++;
+        }
+      }
+    }
   }
 
-  try {
-    const templates = db.prepare(`SELECT id FROM design_templates WHERE thumbnail_url LIKE '/objects/%' OR thumbnail_url LIKE '%/objects/%' OR canvas_data LIKE '%/objects/%'`).all() as any[];
-    for (const template of templates) {
-      totalQueued += queueDesignTemplateMediaDownloads(template.id);
-    }
-  } catch {}
-
-  try {
-    const kiosks = db.prepare(`SELECT id FROM kiosks WHERE data LIKE '%/objects/%'`).all() as any[];
-    for (const kiosk of kiosks) {
-      totalQueued += queueKioskMediaDownloads(kiosk.id);
-    }
-  } catch {}
-
   if (totalQueued > 0) {
-    console.log(`[media-dl] Scanned all content + templates + kiosks — queued ${totalQueued} media downloads`);
+    console.log(`[media-dl] Scanned ${MEDIA_COLUMNS.length} media columns — queued ${totalQueued} downloads`);
   }
   return totalQueued;
 }
+
+// ---------------------------------------------------------------------------
+// Backfill
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-queues any download whose `local_filename` no longer exists on disk.
+ * Called on startup so a manually-deleted media file or a wiped uploads
+ * directory doesn't permanently break references on screens.
+ *
+ * IMPORTANT: we deliberately keep `local_filename` so the redownload writes
+ * to the SAME `/media/<filename>` the JSON content rows already reference.
+ * If we cleared the filename and let downloadMediaFile pick a new one, the
+ * subsequent rewriteAllReferences(object_path → /media/<newFile>) would
+ * find nothing to rewrite — JSON columns no longer contain the original
+ * `object_path`, they contain `/media/<oldFile>` — and player references
+ * would stay broken forever.
+ */
+export function backfillMissingLocalFiles(): number {
+  const db = getDb();
+  const completed = db.prepare(
+    "SELECT id, object_path, local_filename, content_id, field FROM media_downloads WHERE status = 'completed' AND local_filename IS NOT NULL"
+  ).all() as any[];
+
+  const uploadsDir = path.join(getMediaDir(), 'uploads');
+  let reQueued = 0;
+  for (const row of completed) {
+    const filePath = path.join(uploadsDir, row.local_filename);
+    if (fs.existsSync(filePath)) continue;
+    // Preserve local_filename — the re-downloaded bytes will land at the
+    // same /media/<filename> so existing JSON refs heal automatically.
+    // Also clean up any stale partial so we restart from byte 0.
+    const partialPath = filePath + PARTIAL_EXT;
+    try { if (fs.existsSync(partialPath)) fs.unlinkSync(partialPath); } catch {}
+    db.prepare(
+      "UPDATE media_downloads SET status = 'pending', retry_count = 0, error = 'local file missing', bytes_downloaded = 0 WHERE id = ?"
+    ).run(row.id);
+    reQueued++;
+    insertErrorLog({
+      level: 'warn',
+      source: 'media-downloader',
+      message: `Local media file missing — re-queueing download: ${row.object_path}`,
+      context: { localFilename: row.local_filename, contentId: row.content_id, field: row.field },
+    });
+  }
+  return reQueued;
+}
+
+// ---------------------------------------------------------------------------
+// Download loop
+// ---------------------------------------------------------------------------
 
 async function processQueue() {
   if (processing || !isRunning) return;
@@ -200,8 +360,9 @@ async function processQueue() {
 
   try {
     const db = getDb();
+    const maxConcurrent = getMediaDownloaderConcurrency();
     const activeCount = (db.prepare("SELECT COUNT(*) as c FROM media_downloads WHERE status = 'downloading'").get() as any)?.c || 0;
-    const slotsAvailable = MAX_CONCURRENT - activeCount;
+    const slotsAvailable = maxConcurrent - activeCount;
     if (slotsAvailable <= 0) return;
 
     const pending = db.prepare(
@@ -233,38 +394,120 @@ async function downloadMediaFile(item: any) {
   const objectPathSuffix = item.object_path.replace(/^\/objects\//, '');
   const downloadUrl = `${cloudUrl}/api/hub/media/${objectPathSuffix}`;
 
+  const uploadsDir = path.join(getMediaDir(), 'uploads');
+  if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+
+  // Resume support: keep previously-chosen filename + partial file across
+  // restarts. If we don't have one yet, defer the choice until we know the
+  // content-type from the response headers (the file extension matters for
+  // local mime detection on the player side).
+  let localFilename: string | null = item.local_filename || null;
+  let bytesDownloaded: number = Number(item.bytes_downloaded) || 0;
+
+  // If a partial file is missing despite a recorded byte offset, we restart
+  // from zero — the bytes are gone.
+  if (localFilename) {
+    const partialPath = path.join(uploadsDir, localFilename + PARTIAL_EXT);
+    if (!fs.existsSync(partialPath)) {
+      bytesDownloaded = 0;
+      db.prepare('UPDATE media_downloads SET bytes_downloaded = 0 WHERE id = ?').run(item.id);
+    } else {
+      // Trust on-disk size over the recorded offset (truncate/expand as needed).
+      const onDisk = fs.statSync(partialPath).size;
+      if (onDisk !== bytesDownloaded) {
+        bytesDownloaded = onDisk;
+        db.prepare('UPDATE media_downloads SET bytes_downloaded = ? WHERE id = ?').run(bytesDownloaded, item.id);
+      }
+    }
+  }
+
   try {
-    console.log(`[media-dl] Downloading: ${item.object_path}`);
+    const headers: Record<string, string> = { 'x-hub-token': syncState.hub_token };
+    if (bytesDownloaded > 0) {
+      headers['Range'] = `bytes=${bytesDownloaded}-`;
+      console.log(`[media-dl] Resuming: ${item.object_path} from byte ${bytesDownloaded}`);
+    } else {
+      console.log(`[media-dl] Downloading: ${item.object_path}`);
+    }
 
     const res = await fetch(downloadUrl, {
-      headers: {
-        'x-hub-token': syncState.hub_token,
-      },
-      signal: AbortSignal.timeout(5 * 60 * 1000),
+      headers,
+      signal: AbortSignal.timeout(30 * 60 * 1000),
     });
 
-    if (!res.ok) {
+    // 200 = full body returned (server ignored / didn't honor Range).
+    // 206 = partial content (resume succeeded).
+    // 416 = range not satisfiable (the file is shorter than our offset
+    //   — the upstream object was replaced; restart from zero).
+    if (res.status === 416) {
+      // Reset and re-attempt next tick.
+      bytesDownloaded = 0;
+      db.prepare("UPDATE media_downloads SET status = 'pending', bytes_downloaded = 0, error = 'range not satisfiable, restarting' WHERE id = ?").run(item.id);
+      if (localFilename) {
+        const partialPath = path.join(uploadsDir, localFilename + PARTIAL_EXT);
+        try { if (fs.existsSync(partialPath)) fs.unlinkSync(partialPath); } catch {}
+      }
+      return;
+    }
+    if (!res.ok || !res.body) {
       throw new Error(`HTTP ${res.status}: ${res.statusText}`);
     }
 
-    const contentType = res.headers.get('content-type') || 'application/octet-stream';
-    const ext = getExtensionFromMimeOrPath(contentType, item.object_path);
-    const uniqueName = `cloud-${crypto.randomBytes(8).toString('hex')}${ext}`;
-    const uploadsDir = path.join(getMediaDir(), 'uploads');
-    const filePath = path.join(uploadsDir, uniqueName);
+    // Did the server honor our Range request?
+    const isPartial = res.status === 206;
+    if (bytesDownloaded > 0 && !isPartial) {
+      // Server gave us the full body even though we asked for a range —
+      // can't safely append. Truncate the partial and start over.
+      bytesDownloaded = 0;
+      if (localFilename) {
+        const partialPath = path.join(uploadsDir, localFilename + PARTIAL_EXT);
+        try { if (fs.existsSync(partialPath)) fs.unlinkSync(partialPath); } catch {}
+      }
+    }
 
-    const arrayBuffer = await res.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    fs.writeFileSync(filePath, buffer);
+    if (!localFilename) {
+      const contentType = res.headers.get('content-type') || 'application/octet-stream';
+      const ext = getExtensionFromMimeOrPath(contentType, item.object_path);
+      localFilename = `cloud-${crypto.randomBytes(8).toString('hex')}${ext}`;
+      db.prepare('UPDATE media_downloads SET local_filename = ? WHERE id = ?').run(localFilename, item.id);
+    }
+    const partialPath = path.join(uploadsDir, localFilename + PARTIAL_EXT);
+    const finalPath = path.join(uploadsDir, localFilename);
 
-    const fileSize = buffer.length;
-    console.log(`[media-dl] Downloaded: ${item.object_path} -> ${uniqueName} (${(fileSize / 1024).toFixed(1)}KB)`);
+    // Stream the response to the partial file.
+    const writeStream = fs.createWriteStream(partialPath, { flags: bytesDownloaded > 0 ? 'a' : 'w' });
+    let writtenSinceCheckpoint = 0;
+    const CHECKPOINT_BYTES = 256 * 1024; // persist offset every 256KB
+
+    try {
+      // Node's WHATWG stream → async iterator
+      // @ts-ignore — Node's fetch returns a web ReadableStream
+      for await (const chunk of res.body as any) {
+        const buf: Buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        await new Promise<void>((resolve, reject) => {
+          writeStream.write(buf, (err) => err ? reject(err) : resolve());
+        });
+        bytesDownloaded += buf.length;
+        writtenSinceCheckpoint += buf.length;
+        if (writtenSinceCheckpoint >= CHECKPOINT_BYTES) {
+          db.prepare('UPDATE media_downloads SET bytes_downloaded = ? WHERE id = ?').run(bytesDownloaded, item.id);
+          writtenSinceCheckpoint = 0;
+        }
+      }
+    } finally {
+      await new Promise<void>((resolve) => writeStream.end(() => resolve()));
+    }
+
+    fs.renameSync(partialPath, finalPath);
+
+    const fileSize = bytesDownloaded;
+    console.log(`[media-dl] Downloaded: ${item.object_path} -> ${localFilename} (${(fileSize / 1024).toFixed(1)}KB)`);
 
     db.prepare(
-      "UPDATE media_downloads SET status = 'completed', local_filename = ?, file_size = ?, completed_at = datetime('now') WHERE id = ?"
-    ).run(uniqueName, fileSize, item.id);
+      "UPDATE media_downloads SET status = 'completed', local_filename = ?, file_size = ?, bytes_downloaded = ?, completed_at = datetime('now') WHERE id = ?"
+    ).run(localFilename, fileSize, fileSize, item.id);
 
-    rewriteAllReferences(item.object_path, `/media/${uniqueName}`);
+    rewriteAllReferences(item.object_path, `/media/${localFilename}`);
 
   } catch (err: any) {
     const retryCount = (item.retry_count || 0) + 1;
@@ -287,90 +530,90 @@ async function downloadMediaFile(item: any) {
   }
 }
 
-function rewriteScalarField(value: string | null | undefined, objectPath: string, localUrl: string): string | null {
-  if (!value || typeof value !== 'string') return null;
-  if (value === objectPath) return localUrl;
-  const normalized = normalizeToObjectPath(value);
-  if (normalized === objectPath) return localUrl;
-  return null;
-}
+// ---------------------------------------------------------------------------
+// Reference rewriting
+// ---------------------------------------------------------------------------
 
-function rewriteCanvasDataStructurally(canvasJson: string, objectPath: string, localUrl: string): string | null {
-  try {
-    const data = JSON.parse(canvasJson);
-    if (!data?.pages) return null;
-    let changed = false;
+/**
+ * Rewrite every occurrence of `oldRef` to `newRef` across the configured
+ * media-bearing columns. Logs loudly via the error reporter when we find a
+ * row that LIKE-matches the old reference but the schema-aware walker can't
+ * actually rewrite it — that's the case the task description calls out
+ * ("if a reference can't be rewritten, log it loudly rather than silently
+ * leaving a broken cloud URL").
+ */
+function rewriteAllReferences(oldRef: string, newRef: string) {
+  const db = getDb();
+  const unresolved: Array<{ table: string; column: string; rowId: number }> = [];
 
-    for (const page of data.pages) {
-      if (page.backgroundImage) {
-        const norm = normalizeToObjectPath(page.backgroundImage);
-        if (norm === objectPath) { page.backgroundImage = localUrl; changed = true; }
+  withoutTriggers(() => {
+    for (const { table, column, kind } of MEDIA_COLUMNS) {
+      let rows: any[] = [];
+      try {
+        rows = db.prepare(`SELECT id, ${column} AS v FROM ${table} WHERE ${column} LIKE ?`)
+          .all(`%${oldRef}%`) as any[];
+      } catch {
+        continue;
       }
-      if (!page.elements) continue;
-      for (const el of page.elements) {
-        if (!el.properties) continue;
-        for (const key of ['imageUrl', 'videoUrl', 'pdfUrl', 'src']) {
-          if (el.properties[key]) {
-            const norm = normalizeToObjectPath(el.properties[key]);
-            if (norm === objectPath) { el.properties[key] = localUrl; changed = true; }
-          }
+      for (const row of rows) {
+        if (!row.v) continue;
+        const updated = rewriteOneFieldValue(row.v, kind, oldRef, newRef);
+        if (updated !== null) {
+          db.prepare(`UPDATE ${table} SET ${column} = ? WHERE id = ?`).run(updated, row.id);
+        } else {
+          // The string is in the column (LIKE matched) but our walker
+          // couldn't replace it — schema may have evolved in a way we
+          // don't recognize, or the value is malformed JSON.
+          unresolved.push({ table, column, rowId: row.id });
         }
       }
     }
-    return changed ? JSON.stringify(data) : null;
-  } catch {
-    return null;
+  });
+
+  if (unresolved.length > 0) {
+    const sample = unresolved.slice(0, 5);
+    console.error(`[media-dl] ${unresolved.length} unresolved reference(s) for ${oldRef} — broken URL may ship to players`);
+    insertErrorLog({
+      level: 'error',
+      source: 'media-downloader',
+      message: `Could not rewrite media reference ${oldRef} -> ${newRef} in ${unresolved.length} row(s); schema may have evolved`,
+      context: { oldRef, newRef, sample },
+    });
   }
 }
 
-function rewriteAllReferences(objectPath: string, localUrl: string) {
-  const db = getDb();
+function rewriteOneFieldValue(value: string, kind: ColumnKind, oldRef: string, newRef: string): string | null {
+  // For scalar columns, do exact / normalized comparison.
+  if (kind === 'scalar') {
+    const r = walkRewriteString(value, oldRef, newRef);
+    return r;
+  }
 
-  withoutTriggers(() => {
-    db.prepare('UPDATE contents SET data = ? WHERE data = ?').run(localUrl, objectPath);
-    db.prepare('UPDATE contents SET url = ? WHERE url = ?').run(localUrl, objectPath);
-    db.prepare('UPDATE contents SET thumbnail_url = ? WHERE thumbnail_url = ?').run(localUrl, objectPath);
+  // JSON / auto: try parsing first.
+  let parsed: any;
+  let parsedOk = false;
+  try {
+    parsed = JSON.parse(value);
+    parsedOk = parsed !== null && typeof parsed === 'object';
+  } catch {
+    parsedOk = false;
+  }
 
-    const scalarContents = db.prepare("SELECT id, data, url, thumbnail_url FROM contents WHERE data LIKE ? OR url LIKE ? OR thumbnail_url LIKE ?")
-      .all(`%${objectPath}%`, `%${objectPath}%`, `%${objectPath}%`) as any[];
-    for (const row of scalarContents) {
-      const newData = rewriteScalarField(row.data, objectPath, localUrl);
-      if (newData) db.prepare('UPDATE contents SET data = ? WHERE id = ?').run(newData, row.id);
-      const newUrl = rewriteScalarField(row.url, objectPath, localUrl);
-      if (newUrl) db.prepare('UPDATE contents SET url = ? WHERE id = ?').run(newUrl, row.id);
-      const newThumb = rewriteScalarField(row.thumbnail_url, objectPath, localUrl);
-      if (newThumb) db.prepare('UPDATE contents SET thumbnail_url = ? WHERE id = ?').run(newThumb, row.id);
-    }
+  if (parsedOk) {
+    const r = walkRewrite(parsed, oldRef, newRef);
+    return r.changed ? JSON.stringify(parsed) : null;
+  }
 
-    const contentRows = db.prepare("SELECT id, canvas_data FROM contents WHERE canvas_data LIKE ?").all(`%${objectPath}%`) as any[];
-    for (const row of contentRows) {
-      const updated = rewriteCanvasDataStructurally(row.canvas_data, objectPath, localUrl);
-      if (updated) db.prepare('UPDATE contents SET canvas_data = ? WHERE id = ?').run(updated, row.id);
-    }
-
-    db.prepare('UPDATE design_templates SET thumbnail_url = ? WHERE thumbnail_url = ?').run(localUrl, objectPath);
-    const dtScalar = db.prepare("SELECT id, thumbnail_url FROM design_templates WHERE thumbnail_url LIKE ?")
-      .all(`%${objectPath}%`) as any[];
-    for (const row of dtScalar) {
-      const newThumb = rewriteScalarField(row.thumbnail_url, objectPath, localUrl);
-      if (newThumb) db.prepare('UPDATE design_templates SET thumbnail_url = ? WHERE id = ?').run(newThumb, row.id);
-    }
-
-    const dtRows = db.prepare("SELECT id, canvas_data FROM design_templates WHERE canvas_data LIKE ?").all(`%${objectPath}%`) as any[];
-    for (const row of dtRows) {
-      const updated = rewriteCanvasDataStructurally(row.canvas_data, objectPath, localUrl);
-      if (updated) db.prepare('UPDATE design_templates SET canvas_data = ? WHERE id = ?').run(updated, row.id);
-    }
-
-    try {
-      const kioskRows = db.prepare("SELECT id, data FROM kiosks WHERE data LIKE ?").all(`%${objectPath}%`) as any[];
-      for (const row of kioskRows) {
-        const updated = rewriteCanvasDataStructurally(row.data, objectPath, localUrl);
-        if (updated) db.prepare('UPDATE kiosks SET data = ? WHERE id = ?').run(updated, row.id);
-      }
-    } catch {}
-  });
+  // auto fallback: treat as scalar if JSON parse failed
+  if (kind === 'auto') {
+    return walkRewriteString(value, oldRef, newRef);
+  }
+  return null;
 }
+
+// ---------------------------------------------------------------------------
+// Misc helpers + read-side accessors
+// ---------------------------------------------------------------------------
 
 function getExtensionFromMimeOrPath(mimeType: string, objectPath: string): string {
   const pathExt = path.extname(objectPath).toLowerCase();

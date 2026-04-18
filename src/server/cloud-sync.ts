@@ -13,6 +13,7 @@ import {
   updateCloudContactTime,
   enforceLocalFreeScreenLimit,
   reconcileScreenLicenseStatuses,
+  setScreenPairingGrace,
   getUnsentErrorLogs,
   markErrorLogsSent,
   pruneOldErrorLogs,
@@ -23,6 +24,14 @@ import {
   removeIdMapping,
   getUnmappedLocalRecords,
   logSyncConflict,
+  pruneOrphanIdMappings,
+  getOldestUnpushedAgeMs,
+  getUnpushedChangeCount,
+  dedupeUnackedDeleteTombstones,
+  emergencyDropOldestChanges,
+  pruneAckedChanges,
+  pruneStaleUnackedChanges,
+  hasPendingInsert,
 } from '../db/sqlite';
 import { broadcastToPlayers } from './player-bus';
 import { broadcastToDashboard } from './dashboard-bus';
@@ -62,6 +71,12 @@ export class CloudSync {
   private pendingNonInserts: any[] | null = null;
   private static readonly BASE_RECONNECT_MS = 10_000;
   private static readonly MAX_RECONNECT_MS = 5 * 60 * 1000;
+  private static readonly RECONNECT_JITTER = 0.25;
+  private static readonly AUTH_TIMEOUT_MS = 15_000;
+  private static readonly CHANGE_LOG_STALL_MS = 60 * 60 * 1000;
+  private static readonly CHANGE_LOG_HARD_CAP = 100_000;
+  private lastChangeLogStallAlertAt = 0;
+  private cachedSocketLocalIp: string | undefined;
 
   constructor(cloudUrl: string, hubToken: string, onAuthFailure?: () => void) {
     this.cloudUrl = cloudUrl;
@@ -72,6 +87,15 @@ export class CloudSync {
   start() {
     if (this.isRunning) return;
     this.isRunning = true;
+    // One-time startup cleanup of accumulated orphans / acked entries.
+    try {
+      const pruned = pruneOrphanIdMappings();
+      if (pruned > 0) console.log(`[cloud-sync] Startup: pruned ${pruned} orphan hub_id_map rows`);
+      const prunedChanges = pruneAckedChanges({ hardCap: CloudSync.CHANGE_LOG_HARD_CAP });
+      if (prunedChanges > 0) console.log(`[cloud-sync] Startup: pruned ${prunedChanges} acked local_changes`);
+    } catch (e: any) {
+      console.error('[cloud-sync] Startup cleanup failed:', e?.message || e);
+    }
     this.connect();
     if (!this.errorReportInterval) {
       this.reportErrorsToCloud();
@@ -100,6 +124,7 @@ export class CloudSync {
     if (!this.isRunning) return;
 
     this.isAuthenticated = false;
+    this.pendingNonInserts = null;
     let didOpen = false;
     const base = this.cloudUrl.replace(/^http/, 'ws').replace(/\/ws\/?$/, '').replace(/\/$/, '');
     const wsUrl = `${base}/ws`;
@@ -108,34 +133,25 @@ export class CloudSync {
     this.ws.on('open', () => {
       didOpen = true;
       console.log('[cloud-sync] Connected to cloud');
-      let identifyIp: string | undefined;
-      try {
-        const os = require('os');
-        const ifaces = os.networkInterfaces();
-        for (const name of Object.keys(ifaces)) {
-          for (const iface of ifaces[name] || []) {
-            if (iface.family === 'IPv4' && !iface.internal) {
-              identifyIp = iface.address;
-              break;
-            }
-          }
-          if (identifyIp) break;
-        }
-      } catch {}
+      this.cachedSocketLocalIp = this.getActiveSocketLocalIp();
+      const identifyIp = this.cachedSocketLocalIp || this.getFallbackLocalIp();
       this.send({ type: 'hubIdentify', payload: { hubToken: this.hubToken, ipAddress: identifyIp } });
 
       if (this.authTimeout) clearTimeout(this.authTimeout);
       this.authTimeout = setTimeout(() => {
         if (!this.isAuthenticated && this.isRunning) {
-          console.error('[cloud-sync] Auth timeout — no hubConnected received within 15s, treating as auth failure');
+          // Treat as a transient connect failure (cloud is slow / dropped the handshake),
+          // NOT an auth failure. The cloud signals real auth failures via an explicit
+          // 'error' message containing 'invalid hub token' / 'unauthorized'.
+          console.warn('[cloud-sync] No hubConnected within auth timeout — closing socket and reconnecting');
           insertErrorLog({
-            level: 'error',
+            level: 'warn',
             source: 'cloud-sync',
-            message: 'Hub authentication timed out — hub token may be invalid',
+            message: 'Hub auth handshake timed out — will retry',
           });
-          this.handleAuthFailure();
+          try { this.ws?.close(); } catch {}
         }
-      }, 15000);
+      }, CloudSync.AUTH_TIMEOUT_MS);
     });
 
     this.ws.on('message', (raw) => {
@@ -155,19 +171,23 @@ export class CloudSync {
       }
       this.stopHeartbeat();
       this.stopTieredSync();
+      this.pendingNonInserts = null;
 
-      if (!didOpen) {
+      // Treat ANY close-without-stable-auth as a connect failure for backoff purposes.
+      // This catches open-then-handshake-timeout churn (didOpen=true, isAuthenticated=false)
+      // as well as raw connect refusals (didOpen=false). The streak is only reset in
+      // `hubConnected` where the cloud has actually accepted the auth handshake.
+      // (Used to permanently stop sync after 5 failures; we now keep retrying forever.)
+      if (!this.isAuthenticated) {
         this.consecutiveFailures++;
-        console.log(`[cloud-sync] Connection failed without opening (attempt ${this.consecutiveFailures})`);
-        if (this.consecutiveFailures >= 5) {
-          console.error('[cloud-sync] 5 consecutive connection failures — treating as auth failure');
+        const phase = didOpen ? 'after open' : 'before open';
+        console.log(`[cloud-sync] Connection lost ${phase} without auth (attempt ${this.consecutiveFailures})`);
+        if (this.consecutiveFailures === 10 || (this.consecutiveFailures > 10 && this.consecutiveFailures % 30 === 0)) {
           insertErrorLog({
-            level: 'error',
+            level: 'warn',
             source: 'cloud-sync',
-            message: `WebSocket failed to connect ${this.consecutiveFailures} times consecutively`,
+            message: `Cloud connection has failed to authenticate ${this.consecutiveFailures} times consecutively — still retrying`,
           });
-          this.handleAuthFailure();
-          return;
         }
       }
 
@@ -177,11 +197,56 @@ export class CloudSync {
     this.ws.on('error', (err) => {
       console.error('[cloud-sync] Connection error:', err.message);
       insertErrorLog({
-        level: 'error',
+        level: 'warn',
         source: 'cloud-sync',
         message: `WebSocket connection error: ${err.message}`,
       });
     });
+  }
+
+  /**
+   * Returns the local IPv4 address of the socket actually connected to the cloud.
+   * On multi-NIC hosts (Ethernet + WiFi, VPN, etc.) this is the only address that's
+   * meaningful to report to the cloud — the OS chose it via the routing table.
+   */
+  private getActiveSocketLocalIp(): string | undefined {
+    try {
+      // ws@8 exposes the underlying net.Socket via the `_socket` private field;
+      // there's no public typing for it. We cast to a narrow shape rather than `any`.
+      const wsWithSocket = this.ws as unknown as { _socket?: { localAddress?: string } };
+      const sock = wsWithSocket?._socket;
+      const addr = sock?.localAddress;
+      if (!addr) return undefined;
+      // Strip IPv6-mapped-IPv4 prefix (::ffff:192.168.x.x).
+      const stripped = addr.replace(/^::ffff:/, '');
+      // Skip IPv6 link-local / loopback.
+      if (stripped === '::1' || stripped === '127.0.0.1' || stripped.startsWith('fe80')) {
+        return undefined;
+      }
+      // If it's IPv4, return as-is. Otherwise return the raw address (IPv6).
+      return stripped;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Fallback IP detection — picks the first non-internal IPv4 interface.
+   * Used only when we can't read the active socket's local address.
+   */
+  private getFallbackLocalIp(): string | undefined {
+    try {
+      const os = require('os');
+      const ifaces = os.networkInterfaces();
+      for (const name of Object.keys(ifaces)) {
+        for (const iface of ifaces[name] || []) {
+          if (iface.family === 'IPv4' && !iface.internal) {
+            return iface.address;
+          }
+        }
+      }
+    } catch {}
+    return undefined;
   }
 
   private handleAuthFailure() {
@@ -232,6 +297,18 @@ export class CloudSync {
       case 'hubSyncPushAck': {
         const ackedIds = data.payload?.changeIds || [];
         if (ackedIds.length > 0) {
+          // Before marking pushed, look at any DELETE entries we just got acked for
+          // and remove their hub_id_map row (the cloud has confirmed it's gone).
+          try {
+            const db = getDb();
+            const placeholders = ackedIds.map(() => '?').join(',');
+            const ackedDeletes = db.prepare(
+              `SELECT table_name, record_id FROM local_changes WHERE id IN (${placeholders}) AND operation = 'DELETE'`
+            ).all(...ackedIds) as Array<{ table_name: string; record_id: number }>;
+            for (const d of ackedDeletes) {
+              try { removeIdMapping(d.table_name, d.record_id); } catch {}
+            }
+          } catch {}
           markChangesPushed(ackedIds);
           console.log(`[cloud-sync] ${ackedIds.length} changes acknowledged by cloud`);
         }
@@ -258,42 +335,20 @@ export class CloudSync {
             }
           }
         }
-        if (this.pendingNonInserts && this.pendingNonInserts.length > 0) {
-          const deferred = this.pendingNonInserts;
-          this.pendingNonInserts = null;
-          console.log(`[cloud-sync] INSERT ACK received, now pushing ${deferred.length} deferred UPDATE/DELETE changes`);
-          const mapChange = (change: any) => {
-            const row = change.operation !== 'DELETE'
-              ? getFullRow(change.table_name, change.record_id)
-              : null;
-            let effectiveRecordId = change.record_id;
-            if (change.operation === 'UPDATE' || change.operation === 'DELETE') {
-              const cloudId = getCloudId(change.table_name, change.record_id);
-              if (cloudId) effectiveRecordId = cloudId;
-            }
-            let changeData = row || JSON.parse(change.payload || '{}');
-            if (change.operation !== 'DELETE' && changeData) {
-              changeData = this.remapForeignKeys(change.table_name, changeData);
-            }
-            if (effectiveRecordId !== change.record_id && changeData) {
-              changeData.id = effectiveRecordId;
-            }
-            return {
-              id: change.id,
-              tableName: change.table_name,
-              recordId: effectiveRecordId,
-              localRecordId: change.record_id,
-              operation: change.operation,
-              data: changeData,
-            };
-          };
-          const changes = deferred.map(mapChange);
-          this.send({
-            type: 'hubSyncPush',
-            payload: { changes },
-          });
-        } else {
-          this.pendingNonInserts = null;
+        // Drain any remaining unpushed changes — but ONLY if the cloud actually
+        // made progress on this round. Re-draining after a pure-failure ack
+        // would create a hot retry loop (ack→push→ack→push) for rows the
+        // cloud is rejecting. Failed rows wait for the next scheduled sync
+        // cycle / heartbeat-driven retry instead, which provides natural
+        // backoff. We allow drain when:
+        //   • At least one row was acked (progress on push side), OR
+        //   • At least one new id mapping arrived (unblocks deferred non-INSERTs)
+        // and skip when the only payload was failures.
+        this.pendingNonInserts = null;
+        const madeProgress = ackedIds.length > 0
+          || (Array.isArray(mappings) && mappings.length > 0);
+        if (madeProgress && getUnpushedChangeCount() > 0) {
+          this.pushChanges();
         }
         break;
       }
@@ -327,6 +382,46 @@ export class CloudSync {
         });
         break;
 
+      case 'priorityLicenseSync':
+        // Lighter-weight than forceSyncNow: pulls subscription/license state,
+        // reconciles local license_status, runs free-screen enforcement (which
+        // honors pairing-grace markers), and notifies players so any
+        // expired/active UI flips immediately. Only broadcasts licenseChanged
+        // on a successful subscription fetch so players don't flip UI off of
+        // stale state during a transient network blip.
+        console.log('[cloud-sync] Received priorityLicenseSync — running on-demand license reconciliation');
+        // syncSubscriptionFirst already calls reconcileScreenLicenseStatuses
+        // + enforceLocalFreeScreenLimit on success; we just need to broadcast
+        // to players. On failure, run reconcile/enforce ourselves so any
+        // partially-updated local state is at least re-evaluated.
+        this.syncSubscriptionFirst().then(
+          () => {
+            broadcastToPlayers({ type: 'licenseChanged', payload: {} });
+          },
+          (err) => {
+            console.warn('[cloud-sync] priorityLicenseSync subscription fetch failed; skipping broadcast', err?.message || err);
+            reconcileScreenLicenseStatuses();
+            enforceLocalFreeScreenLimit();
+          },
+        );
+        break;
+
+      case 'pairingGrace': {
+        // Cloud lets us know a pairing just happened so we don't transiently
+        // expire the new screen via the "1 free screen" path before the
+        // subscription/license sync catches up.
+        const pairingCode = data.payload?.pairingCode;
+        const durationMs = Number(data.payload?.durationMs) || 10 * 60 * 1000;
+        if (typeof pairingCode === 'string' && pairingCode.length > 0) {
+          try {
+            setScreenPairingGrace(pairingCode, durationMs);
+          } catch (err) {
+            console.warn('[cloud-sync] Failed to set pairing grace for', pairingCode, err);
+          }
+        }
+        break;
+      }
+
       default:
         break;
     }
@@ -337,20 +432,7 @@ export class CloudSync {
       const db = getDb();
       const onlineScreens = (db.prepare('SELECT COUNT(*) as count FROM screens WHERE is_online = 1').get() as any)?.count || 0;
 
-      let localIp: string | undefined;
-      try {
-        const os = require('os');
-        const ifaces = os.networkInterfaces();
-        for (const name of Object.keys(ifaces)) {
-          for (const iface of ifaces[name] || []) {
-            if (iface.family === 'IPv4' && !iface.internal) {
-              localIp = iface.address;
-              break;
-            }
-          }
-          if (localIp) break;
-        }
-      } catch {}
+      const localIp = this.getActiveSocketLocalIp() || this.cachedSocketLocalIp || this.getFallbackLocalIp();
 
       this.send({
         type: 'hubHeartbeat',
@@ -364,7 +446,114 @@ export class CloudSync {
 
       this.pullChanges(['realtime']);
       this.pushChanges();
+      this.checkChangeLogHealth();
     }, 5 * 60 * 1000);
+  }
+
+  /**
+   * Detect when sync_change_log entries are stalling (likely indicates the cloud
+   * is silently dropping pushes / not acking) and prune already-acked entries to
+   * keep the table size in check.
+   */
+  private checkChangeLogHealth() {
+    try {
+      const oldestMs = getOldestUnpushedAgeMs();
+      const unpushed = getUnpushedChangeCount();
+
+      if (unpushed > 0 && oldestMs > CloudSync.CHANGE_LOG_STALL_MS) {
+        const now = Date.now();
+        // Only alert at most once per hour to avoid log spam.
+        if (now - this.lastChangeLogStallAlertAt > 60 * 60 * 1000) {
+          this.lastChangeLogStallAlertAt = now;
+          const ageMin = Math.round(oldestMs / 60000);
+          console.error(`[cloud-sync] change log stalled: ${unpushed} unpushed entries, oldest is ${ageMin}m old`);
+          insertErrorLog({
+            level: 'error',
+            source: 'cloud-sync',
+            message: `Local change log appears stalled: ${unpushed} unpushed entries, oldest ${ageMin} minutes old`,
+            context: { unpushed, oldestAgeMs: oldestMs },
+          });
+        }
+      }
+
+      // Routine cleanup of acked rows.
+      const pruned = pruneAckedChanges({ hardCap: CloudSync.CHANGE_LOG_HARD_CAP });
+      if (pruned > 0) {
+        console.log(`[cloud-sync] Pruned ${pruned} acked entries from local_changes`);
+      }
+
+      // Stale-unacked recovery: when an entry has been pushed=0 for longer than
+      // the stall threshold AND is provably redundant (record vanished or a
+      // newer change for the same record exists AND a cloud mapping exists),
+      // drop it to keep the change log from growing without bound on prolonged
+      // ack failures. Conservative: never drops a tombstone unilaterally and
+      // never drops the only INSERT for an unmapped record.
+      if (oldestMs > CloudSync.CHANGE_LOG_STALL_MS) {
+        const recovered = pruneStaleUnackedChanges({ minAgeMs: CloudSync.CHANGE_LOG_STALL_MS });
+        if (recovered > 0) {
+          console.warn(`[cloud-sync] Recovered ${recovered} stale unacked entries (provably redundant)`);
+          insertErrorLog({
+            level: 'warn',
+            source: 'cloud-sync',
+            message: `Pruned ${recovered} stale unacked change-log entries to prevent unbounded growth`,
+            context: { recovered },
+          });
+        }
+      }
+
+      // Tombstone dedup: collapse duplicate unacked DELETE rows for the same
+      // (table, record_id). Always safe — cloud only needs one tombstone per
+      // logical record. Bounds growth from any reentrant trigger paths.
+      const dedupedTombstones = dedupeUnackedDeleteTombstones();
+      if (dedupedTombstones > 0) {
+        console.warn(`[cloud-sync] Deduped ${dedupedTombstones} duplicate DELETE tombstones`);
+      }
+
+      // Final, provably-bounded safety valve. If conservative pruning + dedup
+      // can't keep up (sustained outage producing many unique tombstones),
+      // we MUST cap the queue or the disk fills up. Strategy:
+      //   - At 1× hard cap: alert.
+      //   - At 2× hard cap: emergency drop oldest down to hard cap. We log
+      //     critically and prefer to drop already-acked rows and non-DELETE
+      //     unacked rows before tombstones; only as a last resort do tombstones
+      //     get dropped. This is data-loss-acceptable vs. unbounded growth.
+      const totalUnpushed = getUnpushedChangeCount();
+      const emergencyThreshold = CloudSync.CHANGE_LOG_HARD_CAP * 2;
+      if (totalUnpushed > CloudSync.CHANGE_LOG_HARD_CAP) {
+        const now = Date.now();
+        if (now - this.lastChangeLogStallAlertAt > 60 * 60 * 1000) {
+          this.lastChangeLogStallAlertAt = now;
+          console.error(`[cloud-sync] CRITICAL: ${totalUnpushed} unpushed change-log entries exceed hard cap (${CloudSync.CHANGE_LOG_HARD_CAP})`);
+          insertErrorLog({
+            level: 'error',
+            source: 'cloud-sync',
+            message: `Change log exceeded hard cap: ${totalUnpushed} unpushed entries (limit ${CloudSync.CHANGE_LOG_HARD_CAP}). Investigate ack backlog.`,
+            context: { unpushed: totalUnpushed, hardCap: CloudSync.CHANGE_LOG_HARD_CAP },
+          });
+        }
+      }
+      if (totalUnpushed > emergencyThreshold) {
+        const dropped = emergencyDropOldestChanges(CloudSync.CHANGE_LOG_HARD_CAP);
+        if (dropped > 0) {
+          console.error(`[cloud-sync] EMERGENCY: dropped ${dropped} oldest change-log entries (queue exceeded ${emergencyThreshold})`);
+          insertErrorLog({
+            level: 'error',
+            source: 'cloud-sync',
+            message: `Emergency change-log drop: removed ${dropped} oldest entries to bound queue at ${CloudSync.CHANGE_LOG_HARD_CAP}. DATA LOSS POSSIBLE for sustained-outage records.`,
+            context: { dropped, capAfter: CloudSync.CHANGE_LOG_HARD_CAP, threshold: emergencyThreshold },
+          });
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[cloud-sync] checkChangeLogHealth failed:', msg);
+      insertErrorLog({
+        level: 'warn',
+        source: 'cloud-sync',
+        message: 'checkChangeLogHealth failed',
+        context: { error: msg },
+      });
+    }
   }
 
   private stopHeartbeat() {
@@ -402,6 +591,14 @@ export class CloudSync {
 
   private reconcileUnmappedRecords() {
     try {
+      // Clean up orphan id mappings whose local rows no longer exist. This bounds
+      // the hub_id_map table indefinitely and prevents stale mappings from causing
+      // resurrected-record bugs after a delete/recreate cycle.
+      const prunedMappings = pruneOrphanIdMappings();
+      if (prunedMappings > 0) {
+        console.log(`[cloud-sync] Pruned ${prunedMappings} orphan hub_id_map rows`);
+      }
+
       const unmapped = getUnmappedLocalRecords();
       if (unmapped.length === 0) return;
 
@@ -438,9 +635,15 @@ export class CloudSync {
   private scheduleReconnect() {
     if (!this.isRunning) return;
     const exponent = Math.max(0, this.consecutiveFailures - 1);
-    const delay = Math.min(
+    const baseDelay = Math.min(
       CloudSync.BASE_RECONNECT_MS * Math.pow(2, exponent),
       CloudSync.MAX_RECONNECT_MS,
+    );
+    // ±25% jitter so a fleet of hubs does not stampede the cloud after an outage.
+    const jitterRange = baseDelay * CloudSync.RECONNECT_JITTER;
+    const delay = Math.max(
+      CloudSync.BASE_RECONNECT_MS / 2,
+      Math.floor(baseDelay + (Math.random() * 2 - 1) * jitterRange),
     );
     console.log(`[cloud-sync] Reconnecting in ${Math.round(delay / 1000)}s (failures: ${this.consecutiveFailures})`);
     this.reconnectTimeout = setTimeout(() => this.connect(), delay);
@@ -502,13 +705,43 @@ export class CloudSync {
 
     const inserts: any[] = [];
     const nonInserts: any[] = [];
+    const blockedNonInserts: any[] = [];
+
+    // Index inserts in this batch by (table, localId) so we can detect
+    // dependent UPDATE/DELETE operations whose target hasn't been mapped yet.
+    const insertsInBatch = new Set<string>();
+    for (const change of unpushed) {
+      if (change.operation === 'INSERT') {
+        insertsInBatch.add(`${change.table_name}:${change.record_id}`);
+      }
+    }
 
     for (const change of unpushed) {
       if (change.operation === 'INSERT') {
         inserts.push(change);
-      } else {
-        nonInserts.push(change);
+        continue;
       }
+      // For UPDATE/DELETE: if there's no cloud id yet, AND there's still a pending
+      // INSERT for this record (in this batch or earlier), hold this change back.
+      // It will get picked up automatically on the next pushChanges() drain after
+      // the INSERT is acknowledged and an id mapping is established.
+      const hasCloudMapping = !!getCloudId(change.table_name, change.record_id);
+      const key = `${change.table_name}:${change.record_id}`;
+      if (!hasCloudMapping && (insertsInBatch.has(key) || hasPendingInsert(change.table_name, change.record_id))) {
+        blockedNonInserts.push(change);
+        continue;
+      }
+      nonInserts.push(change);
+    }
+
+    if (blockedNonInserts.length > 0) {
+      console.log(`[cloud-sync] Holding back ${blockedNonInserts.length} UPDATE/DELETE entries pending INSERT acks`);
+    }
+
+    if (inserts.length === 0 && nonInserts.length === 0) {
+      // Everything is blocked waiting on prior inserts — nothing to send right now.
+      // The next push ack (or heartbeat-driven push) will pick these up.
+      return;
     }
 
     const mapChange = (change: any) => {

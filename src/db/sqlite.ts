@@ -95,8 +95,10 @@ export function getDb(): Database.Database {
   return db;
 }
 
-export function initDatabase() {
-  const dbPath = path.join(app.getPath('userData'), 'digipal-local.db');
+export function initDatabase(overridePath?: string) {
+  // overridePath lets tests / non-Electron callers pass an explicit DB path
+  // (e.g. ':memory:') without depending on Electron's userData directory.
+  const dbPath = overridePath ?? path.join(app.getPath('userData'), 'digipal-local.db');
   db = new Database(dbPath);
 
   db.pragma('journal_mode = WAL');
@@ -1152,6 +1154,9 @@ function runMigrations(database: Database.Database) {
   };
 
   addColumnIfMissing('screens', 'license_status', "TEXT DEFAULT 'none'");
+  addColumnIfMissing('screens', 'pairing_grace_until', 'TEXT');
+  addColumnIfMissing('media_downloads', 'bytes_downloaded', 'INTEGER DEFAULT 0');
+  addColumnIfMissing('media_downloads', 'expected_size', 'INTEGER');
   addColumnIfMissing('sync_state', 'last_cloud_contact_at', 'TEXT');
   addColumnIfMissing('sync_state', 'hub_revoked', 'INTEGER DEFAULT 0');
   addColumnIfMissing('sync_state', 'hub_name', 'TEXT');
@@ -1239,9 +1244,21 @@ export function markChangesPushed(ids: number[]): void {
   db.prepare(`UPDATE local_changes SET pushed = 1 WHERE id IN (${placeholders})`).run(...ids);
 }
 
+// Hub-local columns that must NEVER be pushed up to the cloud (the cloud
+// schema does not have them). Keyed by table name.
+const HUB_LOCAL_COLUMNS: Record<string, string[]> = {
+  screens: ['pairing_grace_until'],
+};
+
 export function getFullRow(tableName: string, recordId: number): any {
   if (!SYNCED_TABLES.includes(tableName)) return null;
-  return db.prepare(`SELECT * FROM ${tableName} WHERE id = ?`).get(recordId);
+  const row = db.prepare(`SELECT * FROM ${tableName} WHERE id = ?`).get(recordId) as any;
+  if (row && HUB_LOCAL_COLUMNS[tableName]) {
+    for (const col of HUB_LOCAL_COLUMNS[tableName]) {
+      delete row[col];
+    }
+  }
+  return row;
 }
 
 export function upsertRow(tableName: string, data: Record<string, any>): void {
@@ -1356,7 +1373,39 @@ export function isScreenAllowedToPlay(pairingCode: string): { allowed: boolean; 
   return { allowed: true };
 }
 
+// `pairing_grace_until` is a HUB-LOCAL field — it must never be pushed to
+// the cloud (the cloud schema does not have it). Both write paths below run
+// inside `withoutTriggers` so they don't enqueue local_changes rows for the
+// sync engine. Additionally, getFullRow strips this column from outbound
+// payloads as a belt-and-braces measure.
+export function setScreenPairingGrace(pairingCode: string, durationMs: number): number {
+  const until = new Date(Date.now() + durationMs).toISOString();
+  let changes = 0;
+  withoutTriggers(() => {
+    const result = db.prepare(
+      "UPDATE screens SET pairing_grace_until = ? WHERE pairing_code = ?"
+    ).run(until, pairingCode);
+    changes = Number(result.changes) || 0;
+  });
+  if (changes > 0) {
+    console.log(`[pairing-grace] Marked screen ${pairingCode} as grace-protected until ${until}`);
+  }
+  return changes;
+}
+
+export function clearExpiredPairingGrace(): void {
+  const now = new Date().toISOString();
+  withoutTriggers(() => {
+    db.prepare(
+      "UPDATE screens SET pairing_grace_until = NULL WHERE pairing_grace_until IS NOT NULL AND pairing_grace_until <= ?"
+    ).run(now);
+  });
+}
+
 export function enforceLocalFreeScreenLimit(): void {
+  // Sweep expired grace markers up front so they don't shield screens forever.
+  clearExpiredPairingGrace();
+
   const allScreens = db.prepare(
     "SELECT * FROM screens ORDER BY created_at ASC"
   ).all() as any[];
@@ -1380,13 +1429,29 @@ export function enforceLocalFreeScreenLimit(): void {
     }
   }
 
+  const nowIso = new Date().toISOString();
+  const isGraceProtected = (s: any) => s.pairing_grace_until && s.pairing_grace_until > nowIso;
+
   const freeScreens = allScreens.filter((s: any) => !licensedScreenIds.has(s.id) && s.license_status !== 'expired');
 
   if (licensedScreenIds.size > 0) return;
 
   if (freeScreens.length <= 1) return;
 
-  const [keepScreen, ...excessScreens] = freeScreens;
+  // Sort: grace-protected screens first (they MUST stay), then by created_at.
+  // This preserves freshly-paired screens while a license is still propagating.
+  const sorted = [...freeScreens].sort((a, b) => {
+    const aGrace = isGraceProtected(a) ? 0 : 1;
+    const bGrace = isGraceProtected(b) ? 0 : 1;
+    if (aGrace !== bGrace) return aGrace - bGrace;
+    return String(a.created_at || '').localeCompare(String(b.created_at || ''));
+  });
+
+  const [keepScreen, ...rest] = sorted;
+  // Never expire a grace-protected screen.
+  const excessScreens = rest.filter((s: any) => !isGraceProtected(s));
+  if (excessScreens.length === 0) return;
+
   for (const screen of excessScreens) {
     db.prepare("UPDATE screens SET license_status = 'expired' WHERE id = ?").run(screen.id);
   }
@@ -1436,6 +1501,283 @@ export function getLocalId(tableName: string, cloudId: number): number | null {
 
 export function removeIdMapping(tableName: string, localId: number): void {
   db.prepare('DELETE FROM hub_id_map WHERE table_name = ? AND local_id = ?').run(tableName, localId);
+}
+
+/**
+ * Remove hub_id_map rows whose local record no longer exists in the underlying table.
+ * Both the local and cloud sides have effectively forgotten the record (cloud DELETE
+ * already removes the mapping in applyChanges; this catches local-only deletions and
+ * historical orphans accumulated before that path existed).
+ */
+export function pruneOrphanIdMappings(): number {
+  let total = 0;
+  // Allowlist of tables we ever interpolate into dynamic SQL. table_name in hub_id_map
+  // can be set by remote (cloud-supplied) data, so we never pass user-controlled
+  // identifiers through string concatenation.
+  const allowlist = new Set<string>(SYNCED_TABLES);
+
+  const tables = db.prepare(
+    "SELECT DISTINCT table_name FROM hub_id_map"
+  ).all() as Array<{ table_name: string }>;
+
+  for (const { table_name } of tables) {
+    try {
+      if (!allowlist.has(table_name)) {
+        // Unknown / non-synced table reference — drop the mapping rows outright.
+        const result = db.prepare('DELETE FROM hub_id_map WHERE table_name = ?').run(table_name);
+        total += Number(result.changes || 0);
+        continue;
+      }
+      const tableExists = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
+      ).get(table_name);
+      if (!tableExists) {
+        const result = db.prepare('DELETE FROM hub_id_map WHERE table_name = ?').run(table_name);
+        total += Number(result.changes || 0);
+        continue;
+      }
+      const result = db.prepare(`
+        DELETE FROM hub_id_map
+        WHERE table_name = ?
+          AND local_id NOT IN (SELECT id FROM ${table_name})
+      `).run(table_name);
+      total += Number(result.changes || 0);
+    } catch {
+      continue;
+    }
+  }
+  return total;
+}
+
+/**
+ * Returns the age in milliseconds of the oldest unpushed local_changes entry,
+ * or 0 if none exist.
+ */
+export function getOldestUnpushedAgeMs(): number {
+  const row = db.prepare(
+    "SELECT (julianday('now') - julianday(MIN(created_at))) * 86400000 AS age FROM local_changes WHERE pushed = 0"
+  ).get() as { age: number | null } | undefined;
+  return Math.max(0, Math.floor(row?.age ?? 0));
+}
+
+/**
+ * Prune already-pushed local_changes rows older than the given age, while keeping
+ * a configurable safety tail of the most-recent pushed entries for diagnostics.
+ * Also enforces a hard cap on the table size by deleting the oldest pushed rows
+ * when the table grows beyond `hardCap`.
+ */
+export function pruneAckedChanges(opts: {
+  maxAgeMs?: number;
+  keepTail?: number;
+  hardCap?: number;
+} = {}): number {
+  const maxAgeMs = opts.maxAgeMs ?? 7 * 24 * 60 * 60 * 1000;
+  const keepTail = opts.keepTail ?? 2000;
+  const hardCap = opts.hardCap ?? 100_000;
+  let total = 0;
+
+  try {
+    const tailRow = db.prepare(
+      'SELECT id FROM local_changes WHERE pushed = 1 ORDER BY id DESC LIMIT 1 OFFSET ?'
+    ).get(keepTail) as { id: number } | undefined;
+
+    const cutoffSeconds = Math.floor(maxAgeMs / 1000);
+    if (tailRow) {
+      const result = db.prepare(`
+        DELETE FROM local_changes
+        WHERE pushed = 1
+          AND id <= ?
+          AND created_at < datetime('now', ?)
+      `).run(tailRow.id, `-${cutoffSeconds} seconds`);
+      total += Number(result.changes || 0);
+    }
+
+    const totalRow = db.prepare('SELECT COUNT(*) AS c FROM local_changes').get() as { c: number };
+    if (totalRow.c > hardCap) {
+      const excess = totalRow.c - hardCap;
+      const result = db.prepare(`
+        DELETE FROM local_changes
+        WHERE id IN (
+          SELECT id FROM local_changes WHERE pushed = 1 ORDER BY id ASC LIMIT ?
+        )
+      `).run(excess);
+      total += Number(result.changes || 0);
+    }
+  } catch {
+    /* best-effort */
+  }
+
+  return total;
+}
+
+/**
+ * Recover from "stale unacked" change-log buildup — the failure mode where
+ * `pushed=0` rows accumulate forever because acks were missed (cloud outage,
+ * crash before commit, etc.) and no later activity re-derives them.
+ *
+ * Conservative rules — we only ever drop entries that are PROVABLY redundant:
+ *   • Older than `minAgeMs` (default 7d) AND `pushed=0`
+ *   • For INSERT/UPDATE: the underlying local row has since been deleted,
+ *     so the change can never be replayed and the cloud either already
+ *     synced it or will see a future DELETE.
+ *   • For DELETE: a later (newer) INSERT/UPDATE for the same record exists,
+ *     i.e. the row was recreated and the obsolete DELETE would corrupt state.
+ *   • Or a strictly newer same-record INSERT/UPDATE exists, which means the
+ *     newer entry will carry the correct state forward.
+ *
+ * Anything else is left alone — we'd rather keep the queue large than risk
+ * losing a real change. Operates only on the synced-table allowlist so
+ * arbitrary cloud-supplied table names can't drive the SQL path.
+ */
+export function pruneStaleUnackedChanges(opts: { minAgeMs?: number } = {}): number {
+  const minAgeMs = opts.minAgeMs ?? 7 * 24 * 60 * 60 * 1000;
+  const cutoffSeconds = Math.floor(minAgeMs / 1000);
+  let total = 0;
+  const allowlist = new Set<string>(SYNCED_TABLES);
+
+  type Candidate = { id: number; table_name: string; record_id: number; operation: string };
+  let candidates: Candidate[];
+  try {
+    candidates = db.prepare(`
+      SELECT id, table_name, record_id, operation
+      FROM local_changes
+      WHERE pushed = 0
+        AND created_at < datetime('now', ?)
+      ORDER BY id ASC
+      LIMIT 5000
+    `).all(`-${cutoffSeconds} seconds`) as Candidate[];
+  } catch (err) {
+    console.warn('[sqlite] pruneStaleUnackedChanges: candidate scan failed:', (err as Error)?.message);
+    return 0;
+  }
+
+  const deleteStmt = db.prepare('DELETE FROM local_changes WHERE id = ?');
+  const tableExistsStmt = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?");
+  const newerSameRecordStmt = db.prepare(
+    'SELECT 1 FROM local_changes WHERE table_name=? AND record_id=? AND id>? LIMIT 1'
+  );
+  const mappingStmt = db.prepare(
+    'SELECT 1 FROM hub_id_map WHERE table_name=? AND local_id=? LIMIT 1'
+  );
+
+  for (const c of candidates) {
+    if (!allowlist.has(c.table_name)) {
+      // Non-synced table reference — safe to drop the stranded change row.
+      total += Number(deleteStmt.run(c.id).changes || 0);
+      continue;
+    }
+    try {
+      const tableExists = tableExistsStmt.get(c.table_name);
+      if (!tableExists) {
+        total += Number(deleteStmt.run(c.id).changes || 0);
+        continue;
+      }
+
+      // DELETE tombstones are NEVER unilaterally dropped — the cloud has to
+      // acknowledge them, otherwise the record will resurrect on reconciliation.
+      if (c.operation === 'DELETE') continue;
+
+      const stillExists = db.prepare(
+        `SELECT 1 FROM ${c.table_name} WHERE id = ? LIMIT 1`
+      ).get(c.record_id);
+      const hasMapping = !!mappingStmt.get(c.table_name, c.record_id);
+      const newer = !!newerSameRecordStmt.get(c.table_name, c.record_id, c.id);
+
+      // Safety rule #1: if the underlying local row is gone, the INSERT/UPDATE
+      // can't be replayed regardless. Drop it.
+      if (!stillExists) {
+        total += Number(deleteStmt.run(c.id).changes || 0);
+        continue;
+      }
+
+      // Safety rule #2: only drop a redundant INSERT/UPDATE when the cloud
+      // ALREADY HAS A MAPPING for this record (i.e. the cloud has a valid
+      // target for the newer same-record op). Without a mapping, dropping
+      // the only INSERT would strand the later UPDATE/DELETE — they'd be
+      // sent against a local id with no cloud counterpart and reconciliation
+      // can't recover because the pending non-INSERT suppresses re-enqueue.
+      if (newer && hasMapping) {
+        total += Number(deleteStmt.run(c.id).changes || 0);
+        continue;
+      }
+      // Otherwise leave it alone — better to keep a row than risk losing the
+      // only create-side change for an unmapped record.
+    } catch {
+      continue;
+    }
+  }
+  return total;
+}
+
+/**
+ * Collapse duplicate unacked DELETE tombstones for the same (table, record_id):
+ * keep only the newest DELETE, drop the older duplicates. Safe under all
+ * conditions — the cloud only needs one tombstone per logical record. Bounds
+ * the queue's growth contribution from misbehaving triggers or reentrant
+ * delete paths even when the cloud never acks.
+ */
+export function dedupeUnackedDeleteTombstones(): number {
+  try {
+    const result = db.prepare(`
+      DELETE FROM local_changes
+      WHERE pushed = 0
+        AND operation = 'DELETE'
+        AND id NOT IN (
+          SELECT MAX(id) FROM local_changes
+          WHERE pushed = 0 AND operation = 'DELETE'
+          GROUP BY table_name, record_id
+        )
+    `).run();
+    return Number(result.changes || 0);
+  } catch (err) {
+    console.warn('[sqlite] dedupeUnackedDeleteTombstones failed:', (err as Error)?.message);
+    return 0;
+  }
+}
+
+/**
+ * Emergency last-resort safety valve for `local_changes`: when total row count
+ * exceeds `targetCap`, drop the OLDEST entries to bring it back under cap.
+ * This intentionally accepts data loss as the lesser evil vs. unbounded disk
+ * growth. Caller is expected to log critically before invoking.
+ *
+ * Skips entries with operation=DELETE preferentially when possible, but if the
+ * queue is dominated by tombstones it will drop them too — disk integrity wins.
+ *
+ * Returns the number of rows dropped.
+ */
+export function emergencyDropOldestChanges(targetCap: number): number {
+  try {
+    const totalRow = db.prepare('SELECT COUNT(*) AS n FROM local_changes').get() as { n: number };
+    const total = Number(totalRow?.n ?? 0);
+    if (total <= targetCap) return 0;
+    const excess = total - targetCap;
+    // Prefer to drop pushed=1 (acked) rows first; then non-DELETE unacked;
+    // then anything left. Single statement using a sort key.
+    const result = db.prepare(`
+      DELETE FROM local_changes WHERE id IN (
+        SELECT id FROM local_changes
+        ORDER BY pushed DESC, (operation = 'DELETE') ASC, id ASC
+        LIMIT ?
+      )
+    `).run(excess);
+    return Number(result.changes || 0);
+  } catch (err) {
+    console.warn('[sqlite] emergencyDropOldestChanges failed:', (err as Error)?.message);
+    return 0;
+  }
+}
+
+/**
+ * Returns true if there is a pending (unpushed) INSERT for the given (tableName, recordId).
+ * Used by the push pipeline to defer dependent UPDATE/DELETE operations until the
+ * INSERT has been acknowledged and an id mapping has been established.
+ */
+export function hasPendingInsert(tableName: string, recordId: number): boolean {
+  const row = db.prepare(
+    "SELECT 1 FROM local_changes WHERE pushed = 0 AND table_name = ? AND record_id = ? AND operation = 'INSERT' LIMIT 1"
+  ).get(tableName, recordId);
+  return !!row;
 }
 
 const RECONCILABLE_TABLES = [

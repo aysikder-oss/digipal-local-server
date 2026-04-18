@@ -14,7 +14,7 @@ import { registerDashboardClient, unregisterDashboardClient, broadcastToDashboar
 import { SqliteStorage, rowsToCamel, rowToCamel } from '../db/sqlite-storage';
 import { authenticateUser, getSessionSubscriber, initSessionTable, createSession, getSession, deleteSession, cleanExpiredSessions } from './auth';
 import { saveUploadedFile, getMediaDir, getMediaDiskUsage, deleteLocalFile, generateThumbnailBase64, generateVideoThumbnailBase64, isVideoFile } from './file-storage';
-import { startMediaDownloader, stopMediaDownloader, scanAndQueueAllCloudContent, getMediaDownloadStats, getFailedDownloadsByContent, queueContentMediaDownloads } from './media-downloader';
+import { startMediaDownloader, stopMediaDownloader, scanAndQueueAllCloudContent, getMediaDownloadStats, getFailedDownloadsByContent, queueContentMediaDownloads, getMediaDownloaderConcurrency, setMediaDownloaderConcurrency } from './media-downloader';
 import { PLAN_STORAGE_PER_LICENSE_MB, DEFAULT_STORAGE_PER_LICENSE_MB } from '../shared-constants';
 import { generateQrSvg, generateQrDataUrl, generateQrBuffer } from './qr-generator';
 import { buildSecureCookie, isRequestSecure } from './crypto-utils';
@@ -1122,7 +1122,25 @@ export async function startServer(port: number): Promise<number> {
   app.get('/api/customer/media-download-status', requireAuth, (_req: Request, res: Response) => {
     const stats = getMediaDownloadStats();
     const failedItems = getFailedDownloadsByContent();
-    res.json({ ...stats, failedItems });
+    res.json({ ...stats, failedItems, concurrency: getMediaDownloaderConcurrency() });
+  });
+
+  app.get('/api/customer/media-downloader-settings', requireAuth, (_req: Request, res: Response) => {
+    res.json({ concurrency: getMediaDownloaderConcurrency() });
+  });
+
+  app.put('/api/customer/media-downloader-settings', requireAuth, (req: Request, res: Response) => {
+    const { concurrency } = req.body || {};
+    const n = Number(concurrency);
+    if (!Number.isFinite(n) || n < 1 || n > 32) {
+      return res.status(400).json({ message: 'concurrency must be an integer between 1 and 32' });
+    }
+    try {
+      const applied = setMediaDownloaderConcurrency(n);
+      res.json({ concurrency: applied });
+    } catch (err: any) {
+      res.status(400).json({ message: err.message });
+    }
   });
 
   app.post('/api/customer/force-sync', requireAuth, async (req: Request, res: Response) => {
